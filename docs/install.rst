@@ -39,6 +39,8 @@ Do the following (preferably inside a conda environment)::
 The flag ``-e`` (``--editable``) allows you to make changes and try them without
 having to run ``pip`` again.
 
+Alternatively, if you do not wish to limit the ``python`` and ``setuptools`` versions, you can install the ``dev`` branches of ``threeml`` and ``astromodels`` from source, and well as the ``develop`` branch of ``cosipy``.
+
 Troubleshooting
 ---------------
 
