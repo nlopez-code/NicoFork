@@ -4,14 +4,14 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "cosipy"
-version = "0.4.0dev0"
+version = "0.4.1dev0"
 authors = [
           { name = "COSI Team", email = "imc@umd.edu" }
           ]
 description = "High-level analysis for the COSI telescope data"
 requires-python = ">=3.12"
 dependencies = [
-                  "histpy>=2.0.5",
+                  "histpy>=2.0.6",
                   "h5py",
                   "hdf5plugin",
                   "mhealpy>=0.3.7",
