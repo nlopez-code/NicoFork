@@ -20,7 +20,7 @@ from astropy.io import fits
 
 from mhealpy import HealpixBase, HealpixMap
 
-from histpy import Histogram, TimeAxis, HealpixAxis, Axis
+from histpy import Histogram, HealpixAxis, Axis
 
 from scoords import Attitude, SpacecraftFrame
 

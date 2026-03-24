@@ -679,7 +679,7 @@ class UnpolarizedIdealComptonIRF(FarFieldSpectralInstrumentResponseFunctionInter
 
         # Get some needed values from this query
         photon_energy_keV = photon.energy_keV
-        photon_energy = Quantity(photon_energy_keV, u.keV, copy = None)
+        photon_energy = Quantity(photon_energy_keV, u.keV, copy=False)
         measured_energy_keV = np.asarray([event.energy_keV for event in events])
         full_absorp_prob = next(self._full_prob([photon]))
         angres, weights = next(self._angular_resolution([photon]))
@@ -777,7 +777,7 @@ class UnpolarizedIdealComptonIRF(FarFieldSpectralInstrumentResponseFunctionInter
 
             # Get the measured energy based on phi and the energy resolution and absroption probabity for the photon location
             measured_energy = MeasuredEnergyDist(energy, self._energy_resolution, phi, full_absorp_prob).rvs()
-            measured_energy_keV = Quantity(measured_energy, energy.unit, copy=None).to_value(u.keV)
+            measured_energy_keV = Quantity(measured_energy, energy.unit, copy=False).to_value(u.keV)
 
             # Get a random ARM
             angres, weights = next(self._angular_resolution([photon]))

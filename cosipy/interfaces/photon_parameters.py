@@ -140,7 +140,7 @@ class PhotonWithEnergyInterface(PhotonInterface, Protocol):
         """
         Add fancy energy quantity
         """
-        return u.Quantity(self.energy_keV, u.keV, copy=None)
+        return u.Quantity(self.energy_keV, u.keV, copy=False)
 
 
 @runtime_checkable
@@ -279,7 +279,7 @@ class PolarizedPhotonWithDirectionAndEnergyInSCFrameStereographicConventionInter
 
     @property
     def polarization_angle(self) -> PolarizationAngle:
-        return PolarizationAngle(u.Quantity(self.polarization_angle_rad_stereo, u.rad, copy = None), self.direction, 'stereographic')
+        return PolarizationAngle(u.Quantity(self.polarization_angle_rad_stereo, u.rad, copy=False), self.direction, 'stereographic')
 
 @runtime_checkable
 class PolarizedPhotonWithDirectionAndEnergyInSCFrameStereographicConventionInterface(PolarizedPhotonWithDirectionAndEnergyInSCFrameStereographicConventionInterfaceGen[float], PhotonWithDirectionAndEnergyInSCFrameInterface, PolarizedPhotonStereographicConventionInSCInterface, Protocol):...

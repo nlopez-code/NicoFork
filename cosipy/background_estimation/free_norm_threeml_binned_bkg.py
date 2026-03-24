@@ -103,7 +103,7 @@ class FreeNormBackground(BackgroundInterface):
         if self._single_component:
             return {self._default_label: u.Quantity(self._norms[0], u.Hz)}
         else:
-            return {l:u.Quantity(n, u.Hz, copy = None) for l,n in zip(self.labels,self._norms)}
+            return {l:u.Quantity(n, u.Hz, copy=False) for l,n in zip(self.labels,self._norms)}
 
     @property
     def ncomponents(self):

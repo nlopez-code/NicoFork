@@ -7,7 +7,7 @@ from histpy import Histogram
 from scoords.spacecraft_frame import SpacecraftFrame
 from astropy.coordinates import SkyCoord
 from cosipy.response.photon_types import PhotonWithDirectionAndEnergyInSCFrame
-from cosipy.image_deconvolution.image_deconvolution_data_interface_base import (
+from cosipy.image_deconvolution.data_interfaces.image_deconvolution_data_interface_base import (
     ImageDeconvolutionDataInterfaceBase,
 )
 
@@ -67,7 +67,7 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         vec = hp.ang2vec(theta, phi)
         
         if radius_deg == None:
-            self._pix_array = mp.nside2npix(self._nside)
+            self._pix_array = np.arange(hp.nside2npix(self._nside))
         else:
             radius_rad = np.deg2rad(radius_deg)
             self._pix_array = mp.query_disc(self._nside, vec, radius_rad)
@@ -152,17 +152,22 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
             )
         return arr
 
-    def calc_expectation(self, model, dict_bkg_norm=None, almost_zero=1e-12):
+    def calc_source_expectation(self, model):
         model = self._coerce_model(model)
-        expectation = self.response_matrix.T @ model
+        return self.response_matrix.T @ model
 
+    def calc_bkg_expectation(self, dict_bkg_norm=None):
+        expectation = np.zeros(self._n_events, dtype=float)
         if dict_bkg_norm is None:
             for key in self.keys_bkg_models():
                 expectation += self._bkg_models[key]
         else:
             for key in self.keys_bkg_models():
                 expectation += dict_bkg_norm.get(key, 1.0) * self._bkg_models[key]
+        return expectation
 
+    def calc_expectation(self, model, dict_bkg_norm=None, almost_zero=1e-12):
+        expectation = self.calc_source_expectation(model) + self.calc_bkg_expectation(dict_bkg_norm)
         return np.where(expectation <= 0, almost_zero, expectation)
 
     def calc_T_product(self, dataspace_histogram):
