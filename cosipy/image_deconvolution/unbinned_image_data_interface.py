@@ -3,7 +3,7 @@ import healpy as hp
 import mhealpy as mp
 import logging
 from astropy import units as u
-from histpy import Histogram
+from histpy import Histogram, Axes, Axis, HealpixAxis
 from scoords.spacecraft_frame import SpacecraftFrame
 from astropy.coordinates import SkyCoord
 from cosipy.response.photon_types import PhotonWithDirectionAndEnergyInSCFrame
@@ -35,7 +35,8 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         exposure_map=None,
         background_models=None,
         source_dir=None,
-        energy = 1050 * u.keV
+        energy=None,
+        energy_edges=None,
     ):
         super().__init__()
 
@@ -46,7 +47,6 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         self._events = events
 
         self._n_events = events.nevents
-        self._event = 1.0
         self._name = "UnbinnedImageDataInterface"
         self._exposure_map = None
         self._bkg_models = None
@@ -66,6 +66,9 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
 
         vec = hp.ang2vec(theta, phi)
         
+        if energy is None:
+            energy = 1050 * u.keV
+
         if radius_deg == None:
             self._pix_array = np.arange(hp.nside2npix(self._nside))
         else:
@@ -90,15 +93,31 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
 
         self._n_model = len(self._photons)
 
+        # Model axes: full-sky 2D (HealpixAxis + EnergyAxis) matching AllSkyImageModel
+        if energy_edges is None:
+            e_keV = energy.to_value(u.keV)
+            energy_edges = u.Quantity([e_keV * 0.9, e_keV * 1.1], u.keV)
+        image_axis  = HealpixAxis(nside=self._nside, scheme='ring', coordsys='galactic', label='lb')
+        energy_axis = Axis(edges=energy_edges, label='Ei', scale='log')
+        self._model_axes = Axes([image_axis, energy_axis])
+        self._data_axes  = Axes([Axis(np.arange(self._n_events + 1), label='event')])
+
+        # event histogram: one count per event
+        self._event = Histogram(self._data_axes, contents=np.ones(self._n_events))
+
         if exposure_map is None:
-            self._exposure_map = aeff.copy()
+            aeff_arr = aeff.copy()
         else:
-            self._exposure_map = np.asarray(exposure_map, dtype=float)
-            if self._exposure_map.shape != (self._n_model,):
+            aeff_arr = np.asarray(exposure_map, dtype=float)
+            if aeff_arr.shape != (self._n_model,):
                 raise ValueError(
                     f"exposure_map must have shape ({self._n_model},), "
-                    f"got {self._exposure_map.shape}"
+                    f"got {aeff_arr.shape}"
                 )
+        # embed per-pixel aeff into full-sky 2D Histogram
+        aeff_fullsky = np.zeros((self._npix, 1), dtype=float)
+        aeff_fullsky[self._pix_array, 0] = aeff_arr
+        self._exposure_map = Histogram(self._model_axes, contents=aeff_fullsky)
 
         if background_models is None:
             background_models = {"background": np.zeros(self._n_events, dtype=float)}
@@ -114,7 +133,7 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
                     f"got {arr.shape}"
                 )
             self._bkg_models[key] = arr
-            self._summed_bkg_models[key] = None
+            self._summed_bkg_models[key] = float(np.sum(arr))
 
         self._response_matrix = None
 
@@ -145,16 +164,23 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         return prob_matrix
 
     def _coerce_model(self, model):
-        arr = np.asarray(model, dtype=float)
+        if isinstance(model, Histogram):
+            contents = model.contents
+            if hasattr(contents, 'value'):
+                contents = contents.value
+            arr = np.asarray(contents[self._pix_array, 0], dtype=float).flatten()
+        else:
+            arr = np.asarray(model, dtype=float).flatten()
         if arr.shape != (self._n_model,):
             raise ValueError(
-                f"model must have shape ({self._n_model},), got {arr.shape}"
+                f"model must have {self._n_model} elements, got {arr.shape}"
             )
         return arr
 
     def calc_source_expectation(self, model):
-        model = self._coerce_model(model)
-        return self.response_matrix.T @ model
+        arr = self._coerce_model(model)
+        result = self.response_matrix.T @ arr
+        return Histogram(self._data_axes, contents=result)
 
     def calc_bkg_expectation(self, dict_bkg_norm=None):
         expectation = np.zeros(self._n_events, dtype=float)
@@ -164,62 +190,54 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         else:
             for key in self.keys_bkg_models():
                 expectation += dict_bkg_norm.get(key, 1.0) * self._bkg_models[key]
-        return expectation
+        return Histogram(self._data_axes, contents=expectation)
 
     def calc_expectation(self, model, dict_bkg_norm=None, almost_zero=1e-12):
-        expectation = self.calc_source_expectation(model) + self.calc_bkg_expectation(dict_bkg_norm)
-        return np.where(expectation <= 0, almost_zero, expectation)
+        combined = self.calc_source_expectation(model).contents + self.calc_bkg_expectation(dict_bkg_norm).contents
+        combined = np.where(combined <= 0, almost_zero, combined)
+        return Histogram(self._data_axes, contents=combined)
 
     def calc_T_product(self, dataspace_histogram):
-        data_vec = np.asarray(dataspace_histogram, dtype=float)
-        if data_vec.shape != (self._n_events,):
-            raise ValueError(
-                f"dataspace_histogram must have shape ({self._n_events},), "
-                f"got {data_vec.shape}"
-            )
-        return self.response_matrix @ data_vec
+        if isinstance(dataspace_histogram, Histogram):
+            data_vec = dataspace_histogram.contents.flatten()
+        else:
+            data_vec = np.asarray(dataspace_histogram, dtype=float).flatten()
+        result_partial = self.response_matrix @ data_vec  # shape (n_model,)
+        result_fullsky = np.zeros((self._npix, 1), dtype=float)
+        result_fullsky[self._pix_array, 0] = result_partial
+        return Histogram(self._model_axes, contents=result_fullsky)
 
     def calc_bkg_model_product(self, key, dataspace_histogram):
-        data_vec = np.asarray(dataspace_histogram, dtype=float)
+        if isinstance(dataspace_histogram, Histogram):
+            data_vec = dataspace_histogram.contents.flatten()
+        else:
+            data_vec = np.asarray(dataspace_histogram, dtype=float).flatten()
         return float(np.dot(self._bkg_models[key], data_vec))
 
     def calc_log_likelihood(self, expectation):
-        expectation = np.where(np.asarray(expectation, dtype=float) <= 0, 1e-12, expectation)
-        return float(np.sum(np.log(expectation) - expectation))
+        if isinstance(expectation, Histogram):
+            arr = expectation.contents.flatten()
+        else:
+            arr = np.asarray(expectation, dtype=float).flatten()
+        arr = np.where(arr <= 0, 1e-12, arr)
+        return float(np.sum(np.log(arr) - arr))
 
 
-
-def unbinned_richardson_lucy(interface, model_init, n_iter=20, dict_bkg_norm=None):
-    model = np.asarray(model_init, dtype=float).copy()
-    log_likelihoods = []
-
-    R_j = interface.exposure_map
-
-    for _ in range(n_iter):
-        expectation = interface.calc_expectation(model, dict_bkg_norm=dict_bkg_norm)
-        log_likelihoods.append(interface.calc_log_likelihood(expectation))
-
-        coeff = interface.calc_T_product(1.0 / expectation)
-
-        norm_coeff = np.zeros_like(coeff)
-        np.divide(coeff, R_j, out=norm_coeff, where=(R_j > 0))
-
-        model *= norm_coeff
-
-    return model, log_likelihoods
 
 import matplotlib.pyplot as plt
-import numpy as np
-import healpy as hp
 
-from cosipy.response.ideal_response import IdealComptonIRF,UnpolarizedIdealComptonIRF, RandomEventDataFromLineInSCFrame
+from cosipy.response.ideal_response import IdealComptonIRF, UnpolarizedIdealComptonIRF, RandomEventDataFromLineInSCFrame
 from cosipy.polarization import StereographicConvention
+from cosipy.image_deconvolution.algorithms.RichardsonLucyBasic import RichardsonLucyBasic
+from cosipy.image_deconvolution.models.allskyimage import AllSkyImageModel
+from cosipy.image_deconvolution.data_interfaces.data_interface_collection import DataInterfaceCollection
+
 # ============================================================
 # Simulate events
 # ============================================================
-np.random.seed(42) # for reproducibility
+np.random.seed(42)
 def simulate_events():
-    events = RandomEventDataFromLineInSCFrame(
+    return RandomEventDataFromLineInSCFrame(
         irf=UnpolarizedIdealComptonIRF.cosi_like(),
         flux=1. / (u.cm * u.cm * u.s),
         duration=1. * u.s,
@@ -230,40 +248,35 @@ def simulate_events():
         polarization_angle=80. * u.deg,
         polarization_convention=StereographicConvention,
     )
-    return events
+
+energy_edges = u.Quantity([945., 1155.], u.keV)  # single bin around 1050 keV
 
 events = simulate_events()
 
-exposure_map = None 
-
 interface = UnbinnedImageDataInterface(
-    irf= UnpolarizedIdealComptonIRF.cosi_like(),
+    irf=UnpolarizedIdealComptonIRF.cosi_like(),
     events=events,
-    nside=16,
-    exposure_map=exposure_map,
+    nside=4,
+    radius_deg=None,
     background_models={},
-    radius_deg=None
+    energy_edges=energy_edges,
 )
 
-model0 = np.ones(len(interface.pix_array), dtype=float) * 1e-6
+initial_model = AllSkyImageModel(nside=4, energy_edges=energy_edges)
+initial_model[:] = 1e-4 * initial_model.unit  # uniform initial guess
 
-model, log_like = unbinned_richardson_lucy(
-    interface=interface,
-    model_init=model0,
-    n_iter=25,
-    dict_bkg_norm={"background": 1.0},
-)
+dataset = DataInterfaceCollection([interface])
+algo = RichardsonLucyBasic(initial_model=initial_model, dataset=dataset, mask=None, parameter={})
+algo.initialization()
+for _ in range(algo.iteration_max):
+    if algo.iteration():
+        break
+algo.finalization()
 
-# Full-sky HEALPix map
-model_map = np.zeros(hp.nside2npix(16), dtype=float)
-model_map[interface.pix_array] = model
+final_model = algo.results[-1]['model']
+model_map = final_model.contents[:, 0]
+if hasattr(model_map, 'value'):
+    model_map = model_map.value
 
 hp.mollview(model_map, title="Deconvolved model", unit="arb", cmap="viridis")
 plt.show()
-
-plt.figure()
-plt.plot(log_like)
-plt.xlabel("Iteration")
-plt.ylabel("Log likelihood")
-plt.title("RL convergence")
-plt.show()    
