@@ -6,9 +6,10 @@ from astropy import units as u
 from histpy import Histogram, Axes, Axis, HealpixAxis
 from scoords.spacecraft_frame import SpacecraftFrame
 from astropy.coordinates import SkyCoord
+from scoords.attitude import Attitude
 from cosipy.response.photon_types import PhotonWithDirectionAndEnergyInSCFrame
 from cosipy.image_deconvolution.data_interfaces.image_deconvolution_data_interface_base import (
-    ImageDeconvolutionDataInterfaceBase,
+    ImageDeconvolutionDataInterfaceBase, 
 )
 
 logging.basicConfig(
@@ -17,6 +18,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+nside = 32
 
 class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
     """
@@ -56,8 +58,7 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
 
         # Define model-space pixels
         if source_dir is None:
-            source_dir = SkyCoord(lon=0.0, lat=75.0, unit="deg", frame=SpacecraftFrame())
-
+            source_dir =  SkyCoord(lon=0., lat=75., unit="deg", frame=SpacecraftFrame())
         lon = source_dir.lon.to_value(u.rad)
         lat = source_dir.lat.to_value(u.rad)
 
@@ -119,8 +120,8 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         aeff_fullsky[self._pix_array, 0] = aeff_arr
         self._exposure_map = Histogram(self._model_axes, contents=aeff_fullsky)
 
-        if background_models is None:
-            background_models = {"background": np.zeros(self._n_events, dtype=float)}
+        #if background_models is None:
+        #    background_models = {"background": np.zeros(self._n_events, dtype=float)}
 
         self._bkg_models = {}
         self._summed_bkg_models = {}
@@ -223,7 +224,6 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         return float(np.sum(np.log(arr) - arr))
 
 
-
 import matplotlib.pyplot as plt
 
 from cosipy.response.ideal_response import IdealComptonIRF, UnpolarizedIdealComptonIRF, RandomEventDataFromLineInSCFrame
@@ -236,13 +236,22 @@ from cosipy.image_deconvolution.data_interfaces.data_interface_collection import
 # Simulate events
 # ============================================================
 np.random.seed(42)
-def simulate_events():
+def simulate_events(nside):
+
+    frame = SpacecraftFrame(attitude = Attitude.identity())
+    coord = SkyCoord(lon=0., lat=75., unit="deg", frame=frame)
+
+    # Nearest pixels
+    m = HealpixAxis(nside=nside, scheme='ring', coordsys=frame, label='lb')
+    
+    coord = m.pix2skycoord(m.ang2pix(coord))
+   
     return RandomEventDataFromLineInSCFrame(
         irf=UnpolarizedIdealComptonIRF.cosi_like(),
         flux=1. / (u.cm * u.cm * u.s),
         duration=1. * u.s,
         energy=1050 * u.keV,
-        direction=SkyCoord(lon=0., lat=75., unit="deg", frame=SpacecraftFrame()),
+        direction=coord,
         polarized_irf=IdealComptonIRF.cosi_like(),
         polarization_degree=0.2,
         polarization_angle=80. * u.deg,
@@ -251,18 +260,21 @@ def simulate_events():
 
 energy_edges = u.Quantity([945., 1155.], u.keV)  # single bin around 1050 keV
 
-events = simulate_events()
+events = simulate_events(nside)
 
 interface = UnbinnedImageDataInterface(
     irf=UnpolarizedIdealComptonIRF.cosi_like(),
     events=events,
-    nside=4,
-    radius_deg=None,
+    nside=nside,
+    radius_deg=10,
     background_models={},
     energy_edges=energy_edges,
 )
 
-initial_model = AllSkyImageModel(nside=4, energy_edges=energy_edges)
+
+
+
+initial_model = AllSkyImageModel(nside=nside, energy_edges=energy_edges)
 initial_model[:] = 1e-4 * initial_model.unit  # uniform initial guess
 
 dataset = DataInterfaceCollection([interface])
