@@ -1,0 +1,23 @@
+model_definition:
+  class: "AllSkyImage"
+  property:
+    nside: 64
+    energy_edges:
+      value: [945., 1155.]
+      unit: "keV"
+    scheme: "ring"
+    coordinate: "galactic"
+    unit: "cm-2 s-1 sr-1"
+  initialization:
+    algorithm: "flat"
+    parameter:
+      value: [1.0e-4]
+      unit: "cm-2 s-1 sr-1"
+
+deconvolution:
+  algorithm: "RLbasic"
+  parameter:
+    iteration_max: 50
+    minimum_flux:
+      value: 0.0
+      unit: "cm-2 s-1 sr-1"
