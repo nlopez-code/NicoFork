@@ -1,3 +1,4 @@
+import pickle
 import numpy as np
 import healpy as hp
 import mhealpy as mp
@@ -17,8 +18,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-nside = 32
 
 class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
     """
@@ -160,6 +159,7 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
                     "Computed %d / %d rows of probability matrix.",
                     i + 1,
                     self._n_model,
+                
                 )
 
         return prob_matrix
@@ -223,72 +223,71 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         arr = np.where(arr <= 0, 1e-12, arr)
         return float(np.sum(np.log(arr) - arr))
 
+    def save(self, path):
+        """Pickle the interface (including the cached response matrix) to disk."""
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+        logger.info("Saved UnbinnedImageDataInterface to %s", path)
 
-import matplotlib.pyplot as plt
+    @classmethod
+    def load(cls, path):
+        """Load a previously saved interface from disk."""
+        with open(path, "rb") as f:
+            obj = pickle.load(f)
+        logger.info("Loaded UnbinnedImageDataInterface from %s", path)
+        return obj
 
-from cosipy.response.ideal_response import IdealComptonIRF, UnpolarizedIdealComptonIRF, RandomEventDataFromLineInSCFrame
-from cosipy.polarization import StereographicConvention
-from cosipy.image_deconvolution.algorithms.RichardsonLucyBasic import RichardsonLucyBasic
-from cosipy.image_deconvolution.models.allskyimage import AllSkyImageModel
-from cosipy.image_deconvolution.data_interfaces.data_interface_collection import DataInterfaceCollection
+#Only for testing
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
 
-# ============================================================
-# Simulate events
-# ============================================================
-np.random.seed(42)
-def simulate_events(nside):
+    from cosipy.response.ideal_response import IdealComptonIRF, UnpolarizedIdealComptonIRF, RandomEventDataFromLineInSCFrame
+    from cosipy.polarization import StereographicConvention
+    from cosipy.image_deconvolution.algorithms.RichardsonLucyBasic import RichardsonLucyBasic
+    from cosipy.image_deconvolution.models.allskyimage import AllSkyImageModel
+    from cosipy.image_deconvolution.data_interfaces.data_interface_collection import DataInterfaceCollection
 
-    frame = SpacecraftFrame(attitude = Attitude.identity())
-    coord = SkyCoord(lon=0., lat=75., unit="deg", frame=frame)
 
-    # Nearest pixels
-    m = HealpixAxis(nside=nside, scheme='ring', coordsys=frame, label='lb')
-    
-    coord = m.pix2skycoord(m.ang2pix(coord))
-   
-    return RandomEventDataFromLineInSCFrame(
+    # ============================================================
+    # Simulate events
+    # ============================================================
+    np.random.seed(42)
+    def simulate_events(nside):
+
+        frame = SpacecraftFrame(attitude = Attitude.identity())
+        coord = SkyCoord(lon=0., lat=75., unit="deg", frame=frame)
+
+        # Nearest pixels
+        m = HealpixAxis(nside=nside, scheme='ring', coordsys=frame, label='lb')
+
+        #Centered at the center of the nearest pixel to the source direction
+        coord = m.pix2skycoord(m.ang2pix(coord))
+
+        return RandomEventDataFromLineInSCFrame(
+            irf=UnpolarizedIdealComptonIRF.cosi_like(),
+            flux=1. / (u.cm * u.cm * u.s),
+            duration=1. * u.s,
+            energy=1050 * u.keV,
+            direction=coord,
+            polarized_irf=IdealComptonIRF.cosi_like(),
+            polarization_degree=0.2,
+            polarization_angle=80. * u.deg,
+            polarization_convention=StereographicConvention,
+        )
+
+    energy_edges = u.Quantity([945., 1155.], u.keV)  # single bin around 1050 keV
+    nside = 64
+    events = simulate_events(nside)
+
+    interface = UnbinnedImageDataInterface(
         irf=UnpolarizedIdealComptonIRF.cosi_like(),
-        flux=1. / (u.cm * u.cm * u.s),
-        duration=1. * u.s,
-        energy=1050 * u.keV,
-        direction=coord,
-        polarized_irf=IdealComptonIRF.cosi_like(),
-        polarization_degree=0.2,
-        polarization_angle=80. * u.deg,
-        polarization_convention=StereographicConvention,
+        events=events,
+        nside=nside,
+        radius_deg=45,
+        background_models={},
+        energy_edges=energy_edges,
     )
 
-energy_edges = u.Quantity([945., 1155.], u.keV)  # single bin around 1050 keV
+    _ = interface.response_matrix  # trigger build before saving
+    interface.save("interface.pkl")
 
-events = simulate_events(nside)
-
-interface = UnbinnedImageDataInterface(
-    irf=UnpolarizedIdealComptonIRF.cosi_like(),
-    events=events,
-    nside=nside,
-    radius_deg=10,
-    background_models={},
-    energy_edges=energy_edges,
-)
-
-
-
-
-initial_model = AllSkyImageModel(nside=nside, energy_edges=energy_edges)
-initial_model[:] = 1e-4 * initial_model.unit  # uniform initial guess
-
-dataset = DataInterfaceCollection([interface])
-algo = RichardsonLucyBasic(initial_model=initial_model, dataset=dataset, mask=None, parameter={})
-algo.initialization()
-for _ in range(algo.iteration_max):
-    if algo.iteration():
-        break
-algo.finalization()
-
-final_model = algo.results[-1]['model']
-model_map = final_model.contents[:, 0]
-if hasattr(model_map, 'value'):
-    model_map = model_map.value
-
-hp.mollview(model_map, title="Deconvolved model", unit="arb", cmap="viridis")
-plt.show()
