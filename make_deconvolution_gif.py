@@ -21,31 +21,51 @@ from cosipy.image_deconvolution.data_interfaces.data_interface_collection import
 # ============================================================
 # Configuration
 # ============================================================
-PKL_PATH    = "interface.pkl"
+COMPOSITE   = False              # set True when PKL came from a multi-file run
+PKL_NAME    = "composites/ns16e505517nall.pkl"
 PARAMS_YAML = "deconvolution_params.yaml"
-OUTPUT_DIR  = "deconvolution_frames"   # directory for per-iteration PNGs
-GIF_PATH    = "deconvolution.gif"
 
-FRAME_DURATION_MS = 600   # milliseconds per frame
-LAST_FRAME_HOLD   = 3     # hold the final frame this many times longer
+_subdir    = "composites" if COMPOSITE else ""
+_pkl_dir   = os.path.join("Jar of Pickles", _subdir) if _subdir else "Jar of Pickles"
+PKL_PATH   = os.path.join(_pkl_dir, PKL_NAME)
+OUTPUT_DIR = os.path.join("deconvolution_frames", _subdir) if _subdir else "deconvolution_frames"
+GIF_PATH   = os.path.join(_subdir, "deconvolution.gif") if _subdir else "deconvolution.gif"
+
+FRAME_DURATION_MS = 100   # milliseconds per frame
+LAST_FRAME_HOLD   = 50     # hold the final frame this many times longer
 
 # Healpy projection settings
 COORD        = "G"
-CMAP         = "viridis"
+CMAP         = "plasma"
 GRATICULE    = True
 LON_SPACING  = 30
-LAT_SPACING  = 25
-UNIT         = "arb"
+LAT_SPACING  = 30
+UNIT         = r"cm$^{-2}$ s$^{-1}$ sr$^{-1}$"
+LOG_SCALE    = True   # set False for linear colorbar
 
 # Marker for reference position (set to None to disable)
-MARKER_LON_DEG = 0.0
-MARKER_LAT_DEG = 0.0
+MARKER_LON_DEG = None
+MARKER_LAT_DEG = None
+
+# Visual style
+_BG_COLOR  = '#0D0F1A'   # deep cerulean background
+_DPI       = 150          # 1920/150 = 12.8 in × 1080/150 = 7.2 in → 1920×1080 px
+_FRAME_W   = 1920
+_FRAME_H   = 930
 
 
-def _render_frame(model_map, iteration, vmin, vmax):
+def _render_frame(model_map, iteration):
     """Render one iteration to a matplotlib figure and return it."""
+    rot = (MARKER_LON_DEG, MARKER_LAT_DEG) if MARKER_LON_DEG is not None else None
+    if LOG_SCALE:
+        vmin = max(float(model_map[model_map > 0].min()), float(model_map.max()) * 1e-4)
+        norm = 'log'
+    else:
+        vmin = 0.0
+        norm = None
+
     hp.projview(
-        model_map,
+        np.array(model_map, dtype=np.float64, copy=True),
         title=f"Iteration {iteration}",
         unit=UNIT,
         cmap=CMAP,
@@ -55,28 +75,64 @@ def _render_frame(model_map, iteration, vmin, vmax):
         longitude_grid_spacing=LON_SPACING,
         latitude_grid_spacing=LAT_SPACING,
         min=vmin,
-        max=vmax,
+        norm=norm,
+        rot=rot,
+        graticule_color='white',
     )
+
+    fig = plt.gcf()
+    fig.set_size_inches(_FRAME_W / _DPI, _FRAME_H / _DPI)
+    fig.set_facecolor(_BG_COLOR)
+
+    for ax in fig.get_axes():
+        ax.set_facecolor(_BG_COLOR)
+        ax.tick_params(colors='white')
+        for spine in ax.spines.values():
+            spine.set_edgecolor('white')
+        for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+            lbl.set_color('white')
+        ax.title.set_color('white')
+
+    # Catch any remaining black lines/text (graticule, colorbar ticks, etc.)
+    for obj in fig.findobj(plt.Line2D):
+        obj.set_color('white')
+    for obj in fig.findobj(plt.Text):
+        obj.set_color('white')
+
     if MARKER_LON_DEG is not None:
+        if rot is not None:
+            r = hp.Rotator(rot=list(rot), inv=False)
+            colat_disp, lon_disp = r(
+                np.deg2rad(90.0 - MARKER_LAT_DEG),
+                np.deg2rad(MARKER_LON_DEG),
+            )
+            lon_plot = np.rad2deg(lon_disp)
+            lat_plot = 90.0 - np.rad2deg(colat_disp)
+        else:
+            lon_plot = MARKER_LON_DEG
+            lat_plot = MARKER_LAT_DEG
         hp.newprojplot(
-            MARKER_LON_DEG, MARKER_LAT_DEG,
+            lon_plot, lat_plot,
             marker='o', lonlat=True, color='red', markersize=4,
         )
-    return plt.gcf()
+
+    return fig
 
 
 def _fig_to_pil(fig):
-    """Convert a matplotlib figure to a PIL Image."""
+    """Convert a matplotlib figure to a PIL Image at exactly _FRAME_W × _FRAME_H."""
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    fig.savefig(buf, format='png', dpi=_DPI, facecolor=_BG_COLOR, bbox_inches='tight')
     buf.seek(0)
     img = Image.open(buf).copy()
     buf.close()
-    return img
+    return img.resize((_FRAME_W, _FRAME_H), Image.LANCZOS)
 
 
 if __name__ == '__main__':
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if _subdir:
+        os.makedirs(_subdir, exist_ok=True)  # parent dir for GIF_PATH
 
     # ---- Run deconvolution ----
     print("Loading interface...")
@@ -86,6 +142,14 @@ if __name__ == '__main__':
     image_decon = ImageDeconvolution()
     image_decon.set_dataset(dataset)
     image_decon.read_parameterfile(PARAMS_YAML)
+
+    # Sync energy edges from the loaded interface so the YAML matches exactly.
+    edges = interface.energy_edges
+    image_decon.override_parameter(
+        f"model_definition:property:energy_edges:value = {edges.value.tolist()}",
+        f"model_definition:property:energy_edges:unit = {str(edges.unit)}",
+    )
+
     image_decon.initialize()
 
     print("Running deconvolution...")
@@ -100,21 +164,17 @@ if __name__ == '__main__':
             contents = contents.value
         maps.append(np.asarray(contents[:, 0], dtype=float))
 
-    # Use a consistent colour scale across all iterations
-    vmin = 0.0
-    vmax = float(np.max([m.max() for m in maps]))
-
     # ---- Render frames ----
     pil_frames = []
     for idx, (result, model_map) in enumerate(zip(results, maps)):
         iteration = result['iteration']
         print(f"  Rendering iteration {iteration} …")
 
-        fig = _render_frame(model_map, iteration, vmin, vmax)
+        fig = _render_frame(model_map, iteration)
 
         # Save PNG
         png_path = os.path.join(OUTPUT_DIR, f"deconvolution_iter_{iteration:04d}.png")
-        fig.savefig(png_path, dpi=150, bbox_inches='tight')
+        fig.savefig(png_path, dpi=_DPI, facecolor=_BG_COLOR, bbox_inches='tight')
 
         # Capture frame for GIF
         pil_frames.append(_fig_to_pil(fig))

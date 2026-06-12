@@ -9,6 +9,7 @@ Usage
     python interactive_deconvolution.py
 """
 
+import os
 import numpy as np
 import healpy as hp
 import matplotlib
@@ -24,8 +25,13 @@ from cosipy.image_deconvolution.data_interfaces.data_interface_collection import
 # ============================================================
 # Configuration
 # ============================================================
-PKL_PATH    = "interface.pkl"
+COMPOSITE   = False              # set True when PKL came from a multi-file run
+PKL_NAME    = "ns8e505517n5e5.pkl"
 PARAMS_YAML = "deconvolution_params.yaml"
+
+_subdir  = "composites" if COMPOSITE else ""
+_pkl_dir = os.path.join("Jar of Pickles", _subdir) if _subdir else "Jar of Pickles"
+PKL_PATH = os.path.join(_pkl_dir, PKL_NAME)
 
 FRAME_MS    = 600    # milliseconds per frame when playing
 
@@ -33,8 +39,9 @@ COORD       = "G"
 CMAP        = "viridis"
 GRATICULE   = True
 LON_SPACING = 30
-LAT_SPACING = 25
-UNIT        = "arb"
+LAT_SPACING = 30
+UNIT        = r"cm$^{-2}$ s$^{-1}$ sr$^{-1}$"
+LOG_SCALE   = False   # set False for linear colorbar
 
 MARKER_LON_DEG = None   # set to a float (e.g. 0.0) to draw a reference marker
 MARKER_LAT_DEG = 0.0
@@ -44,8 +51,14 @@ MARKER_LAT_DEG = 0.0
 # Helpers
 # ============================================================
 
-def _render_to_array(model_map, iteration, vmin, vmax, dpi=120):
+def _render_to_array(model_map, iteration, dpi=120):
     """Render one healpy frame and return it as an (H, W, 3) uint8 array."""
+    if LOG_SCALE:
+        vmin = max(float(model_map[model_map > 0].min()), float(model_map.max()) * 1e-2)
+        norm = 'log'
+    else:
+        vmin = 0.0
+        norm = None
     hp.projview(
         model_map,
         title=f"Iteration {iteration}",
@@ -57,7 +70,7 @@ def _render_to_array(model_map, iteration, vmin, vmax, dpi=120):
         longitude_grid_spacing=LON_SPACING,
         latitude_grid_spacing=LAT_SPACING,
         min=vmin,
-        max=vmax,
+        norm=norm,
     )
     if MARKER_LON_DEG is not None:
         hp.newprojplot(
@@ -106,15 +119,12 @@ if __name__ == '__main__':
         maps.append(np.asarray(contents[:, 0], dtype=float))
         iternums.append(r['iteration'])
 
-    vmin = 0.0
-    vmax = float(max(m.max() for m in maps))
-
     # ---- Pre-render all frames ----
     print("Pre-rendering frames …")
     frames = []
     for i, (m, it) in enumerate(zip(maps, iternums)):
         print(f"  frame {i+1}/{n_iter}  (iteration {it})")
-        frames.append(_render_to_array(m, it, vmin, vmax))
+        frames.append(_render_to_array(m, it))
     print("Done.")
 
     # ---- Interactive figure ----
@@ -139,7 +149,7 @@ if __name__ == '__main__':
     def update(val):
         idx = int(slider.val) - 1
         img_display.set_data(frames[idx])
-        ax_i.set_title(f"Iteration {iternums[idx]}", fontsize=12)
+        ax_i.set_title(f"Iteration {iternums[idx]} - Galactic Coordinates", fontsize=12)
         slider.valtext.set_text(str(iternums[idx]))
         fig_i.canvas.draw_idle()
 

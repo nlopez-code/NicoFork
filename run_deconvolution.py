@@ -1,17 +1,17 @@
+import os
+import re
 import numpy as np
 import healpy as hp
 import matplotlib.pyplot as plt
+import yaml
 
-from astropy import units as u
-from astropy.coordinates import SkyCoord, Galactic
 from astropy.time import Time
-from astropy.table import Table
-from histpy import Histogram, Axes, Axis, HealpixAxis
-from scipy.interpolate import RegularGridInterpolator
-from scoords import Attitude
+from astropy.table import Table, vstack
+from histpy import Histogram
 
 from cosipy.data_io.EmCDSUnbinnedData import TimeTagEmCDSEventDataInSCFrameFromArrays
 from cosipy.response.ml import NFResponse, UnpolarizedNFFarFieldInstrumentResponseFunction
+from cosipy.background_estimation.ml import FreeNormNFUnbinnedBackground, NFBackground
 from cosipy.image_deconvolution.unbinned_image_data_interface import UnbinnedImageDataInterface
 from cosipy.image_deconvolution.image_deconvolution import ImageDeconvolution
 from cosipy.image_deconvolution.data_interfaces.data_interface_collection import DataInterfaceCollection
@@ -19,112 +19,49 @@ from cosipy.image_deconvolution.data_interfaces.data_interface_collection import
 # ============================================================
 # Configuration
 # ============================================================
-FITS_PATH   = "positrons_thin_disk_cont_3months_unbinned_data_filtered_with_SAAcut.fits.gz"
+FITS_PATHS  = [
+    "Positrons_Central_Source_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    "Positrons_from_26Al_line_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    "Positrons_from_44Ti_line_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    "Broad_Bulge_511_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    "Narrow_Bulge_511_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    "positrons_thin_disk_line_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+
+            ]
+
 NF_RSP_PATH = "unpolarized_nfresponse_v1-00.pt"
-PKL_PATH    = "interface.pkl"
-LOAD_PKL    = True          # set True to skip rebuild and load cached interface
+LOAD_PKL    = True           # set True to skip rebuild and load cached interface
 
-N_EVENTS    = 50           # None = full dataset; int = evenly-spaced subsample
+N_EVENTS    = None           # None = full dataset; int = evenly-spaced subsample
 
-NSIDE       = 2              # sky model HEALPix resolution (change in YAML too)
+NSIDE       =  16            # sky model HEALPix resolution (change in YAML too)
 
-# Background — set BKG_FITS_PATH to a GALPROP-format sky-model .dat file to enable.
-BKG_FITS_PATH = "GalTotal_SA100_F98_input.dat"
+# Marker for reference position (set to None to disable)
+MARKER_LON_DEG = None
+MARKER_LAT_DEG = None
 
+rot = (MARKER_LON_DEG, MARKER_LAT_DEG) if MARKER_LON_DEG is not None else None
 
-def _parse_galprop_dat(path):
-    """Parse a GALPROP-format sky-model .dat file.
+# Energy window is read from the YAML file.
+with open("deconvolution_params.yaml") as _f:
+    _params = yaml.safe_load(_f)
+E_MIN_KEV = _params["energy_filter"]["min_keV"]
+E_MAX_KEV = _params["energy_filter"]["max_keV"]
 
-    Returns
-    -------
-    lons_deg : np.ndarray (n_lon,)   galactic longitude bin centers [deg]
-    lats_colat_deg : np.ndarray (n_lat,)  colatitude bin centers [deg]
-                     (0 = north galactic pole, 180 = south)
-    energies_keV : np.ndarray (n_energy,)  energy bin centers [keV]
-    flux : np.ndarray (n_lon, n_lat, n_energy)
-    """
-    lons = lats = energies = None
-    entries = []
+# Background — provide exactly one of these:
+#   BKG_NF_PATH  : path to an NFBackground model (.pt) + SC_FILE_PATH for SpacecraftHistory
+#   BKG_PATH : path to a binned background estimate (.hdf5) from ContinuumEstimation
+# Set the unused option to None.
+BKG_NF_PATH  = 'nfbackground_v1-01.pt'
+SC_FILE_PATH = "DC4_final_530km_3_month_with_slew_1sbins_GalacticEarth_SAA.fits"  # required
+BKG_PATH = None
 
-    with open(path) as f:
-        for line in f:
-            parts = line.split()
-            if not parts:
-                continue
-            tag = parts[0]
-            if tag == 'PA':
-                lons = np.array(parts[1:], dtype=float)
-            elif tag == 'TA':
-                lats = np.array(parts[1:], dtype=float)
-            elif tag == 'EA':
-                energies = np.array(parts[1:], dtype=float)
-            elif tag == 'AP':
-                entries.append((int(parts[1]), int(parts[2]), int(parts[3]), float(parts[4])))
-
-    flux = np.zeros((len(lons), len(lats), len(energies)), dtype=float)
-    for l_idx, b_idx, e_idx, value in entries:
-        flux[l_idx, b_idx, e_idx] = value
-
-    return lons, lats, energies, flux
-
-
-def _galprop_to_per_event_rates(lons_deg, lats_colat_deg, energies_keV,
-                                flux, nside, event_energies_keV, response_sky):
-    """Fold a GALPROP sky model through the response matrix → per-event rates.
-
-    For each event i:
-        B[i] = sum_j M(pixel_j, E_i) * R[j, i]
-
-    The computation is batched over the model's energy bins to avoid a
-    per-event interpolation loop.
-
-    Parameters
-    ----------
-    lons_deg : np.ndarray (n_lon,)
-    lats_colat_deg : np.ndarray (n_lat,)   colatitude [deg]
-    energies_keV : np.ndarray (n_energy,)
-    flux : np.ndarray (n_lon, n_lat, n_energy)
-    nside : int    HEALPix nside of the sky model used in the interface.
-    event_energies_keV : np.ndarray (n_events,)
-    response_sky : np.ndarray (n_sky, n_events)   sky block of the response matrix.
-
-    Returns
-    -------
-    np.ndarray, shape (n_events,)
-    """
-    npix = hp.nside2npix(nside)
-    pix_theta, pix_phi = hp.pix2ang(nside, np.arange(npix))  # colatitude, lon [0, 2pi)
-    pix_lon   = np.degrees(pix_phi)
-    pix_colat = np.degrees(pix_theta)
-
-    # Wrap longitudes into the PA range (≈ –180 to +180 deg)
-    pix_lon = np.where(pix_lon > 180.0, pix_lon - 360.0, pix_lon)
-
-    interp = RegularGridInterpolator(
-        (lons_deg, lats_colat_deg, np.log10(energies_keV)),
-        flux,
-        method='linear',
-        bounds_error=False,
-        fill_value=0.0,
-    )
-
-    # Assign each event to its nearest model energy bin
-    e_idx = np.clip(
-        np.searchsorted(energies_keV, event_energies_keV, side='right') - 1,
-        0, len(energies_keV) - 1,
-    )
-
-    rates = np.zeros(len(event_energies_keV), dtype=float)
-    for k, e_k in enumerate(energies_keV):
-        mask = e_idx == k
-        if not mask.any():
-            continue
-        pts        = np.column_stack([pix_lon, pix_colat, np.full(npix, np.log10(e_k))])
-        sky_flux_k = interp(pts)                        # (n_sky,)
-        rates[mask] = response_sky[:, mask].T @ sky_flux_k
-
-    return rates
-
+_n_str   = re.sub(r'e\+?0*(\d+)', r'e\1', f"{N_EVENTS:.0e}") if N_EVENTS is not None else "all"
+_bkg     = "" if (BKG_NF_PATH is not None or BKG_PATH is not None) else "nb"
+_subdir  = "composites" if len(FITS_PATHS) > 1 else ""
+_pkl_dir = os.path.join("Jar of Pickles", _subdir) if _subdir else "Jar of Pickles"
+_out_dir = os.path.join("Deconvolved Models", _subdir) if _subdir else "Deconvolved Models"
+PKL_PATH = os.path.join(_pkl_dir, f"ns{NSIDE}e{int(E_MIN_KEV)}{int(E_MAX_KEV)}n{_n_str}{_bkg}.pkl")
 
 if __name__ == '__main__':
     # ============================================================
@@ -132,17 +69,32 @@ if __name__ == '__main__':
     # ============================================================
     if LOAD_PKL:
         interface = UnbinnedImageDataInterface.load(PKL_PATH)
+
+        if BKG_PATH is not None:
+            print("Building background model from binned estimate...")
+            hist = Histogram.open(BKG_PATH)
+            projected = hist.project(['Em', 'Phi', 'PsiChi'])
+            bkg_rates = UnbinnedImageDataInterface.background_rates_from_binned_estimate(
+                projected, interface._events
+            )
+            interface.add_background_model('sky_model', bkg_rates)
+            print(f"Background model 'sky_model' ready ({len(bkg_rates)} per-event rates).")
+
     else:
         # --- Read signal FITS and time-sort ---
-        print("Reading signal FITS file...")
-        t = Table.read(FITS_PATH)
+        print(f"Reading {len(FITS_PATHS)} FITS file(s)...")
+        t = vstack([Table.read(p) for p in FITS_PATHS], metadata_conflicts='silent')
         t = t[np.argsort(t['TimeTags'])]
+
+        # Apply energy window first, then subsample so N_EVENTS counts post-cut events.
+        energy_mask = (t['Energies'].data >= E_MIN_KEV) & (t['Energies'].data <= E_MAX_KEV)
+        t = t[energy_mask]
+        print(f"Signal events after energy cut [{E_MIN_KEV}, {E_MAX_KEV}] keV: {len(t)}")
 
         if N_EVENTS is not None:
             indices = np.linspace(0, len(t) - 1, min(N_EVENTS, len(t)), dtype=int)
             t = t[indices]
-
-        print(f"Signal events: {len(t)}")
+            print(f"Subsampled to {len(t)} events.")
 
         # --- Build time-tagged events ---
         times = Time(t['TimeTags'].data, format='unix')
@@ -155,12 +107,9 @@ if __name__ == '__main__':
             scatt_angle_rad      = t['Phi'].data,
         )
 
-        # --- Per-event attitude from pointing columns ---
-        xp = t['Xpointings (glon,glat)'].data
-        zp = t['Zpointings (glon,glat)'].data
-        xpointings = SkyCoord(l=xp[:, 0], b=xp[:, 1], unit='rad', frame=Galactic())
-        zpointings = SkyCoord(l=zp[:, 0], b=zp[:, 1], unit='rad', frame=Galactic())
-        per_event_attitude = Attitude.from_axes(x=xpointings, z=zpointings, frame=Galactic())
+        # --- Spacecraft history ---
+        from cosipy.spacecraftfile import SpacecraftHistory
+        sc_history = SpacecraftHistory.open(SC_FILE_PATH)
 
         # --- IRF ---
         irf = UnpolarizedNFFarFieldInstrumentResponseFunction(
@@ -168,30 +117,39 @@ if __name__ == '__main__':
                        area_compile_mode=None, density_compile_mode=None)
         )
 
+        # --- Background models (resolved before interface construction) ---
+        background_models = {}
+
+        if BKG_NF_PATH is not None:
+            print("Building NF background model...")
+            nf_bkg = NFBackground(BKG_NF_PATH, devices=["cpu"], density_compile_mode=None)
+            bkg = FreeNormNFUnbinnedBackground(nf_bkg, events, sc_history)
+            background_models['nf_bkg'] = bkg
+            print(f"NF background model ready ({events.nevents} per-event densities).")
+
+        if BKG_PATH is not None:
+            print("Building background model from binned estimate...")
+            hist = Histogram.open(BKG_PATH)
+            projected = hist.project(['Em', 'Phi', 'PsiChi'])
+            bkg_rates = UnbinnedImageDataInterface.background_rates_from_binned_estimate(
+                projected, events
+            )
+            background_models['sky_model'] = bkg_rates
+            print(f"Background model 'sky_model' ready ({len(bkg_rates)} per-event rates).")
+
         # --- Build interface and response matrix ---
         print("Building response matrix...")
         interface = UnbinnedImageDataInterface(
-            irf      = irf,
-            events   = events,
-            nside    = NSIDE,
-            attitude = per_event_attitude,
+            irf               = irf,
+            events            = events,
+            nside             = NSIDE,
+            sc_history        = sc_history,
+            energy_edges      = [505.0, 517.0],
+            background_models = background_models or None,
         )
         _ = interface.response_matrix  # trigger build
 
-        # --- Background model from GALPROP .dat (optional) ---
-        if BKG_FITS_PATH is not None:
-            print("Building background model from GALPROP sky model...")
-            lons, lats, energies, flux = _parse_galprop_dat(BKG_FITS_PATH)
-
-            bkg_rates = _galprop_to_per_event_rates(
-                lons, lats, energies, flux,
-                nside              = NSIDE,
-                event_energies_keV = np.asarray(events.energy_keV, dtype=float),
-                response_sky       = interface.response_matrix[:interface._n_sky, :],
-            )
-            interface.add_background_model('gal_continuum', bkg_rates)
-            print(f"Background model added ({len(bkg_rates)} per-event rates).")
-
+        os.makedirs(_pkl_dir, exist_ok=True)
         interface.save(PKL_PATH)
 
     # ============================================================
@@ -201,24 +159,46 @@ if __name__ == '__main__':
     image_decon = ImageDeconvolution()
     image_decon.set_dataset(dataset)
     image_decon.read_parameterfile("deconvolution_params.yaml")
+
+    # Sync energy edges from the interface (min/max of event data) so the
+    # YAML doesn't need to be updated manually when the dataset changes.
+    edges = interface.energy_edges
+    image_decon.override_parameter(
+        f"model_definition:property:energy_edges:value = {edges.value.tolist()}",
+        f"model_definition:property:energy_edges:unit = {str(edges.unit)}",
+    )
+
     image_decon.initialize()
     image_decon.run_deconvolution()
 
     final_model = image_decon.results[-1]['model']
     model_map   = (final_model.contents[:, 0]).value
 
+    has_bkg = BKG_NF_PATH is not None or BKG_PATH is not None
+    bkg_str = " | bkg" if has_bkg else " | no bkg"
+    e_edges = interface.energy_edges
+    e_str   = f"[{e_edges.value[0]:.0f}, {e_edges.value[-1]:.0f}] {e_edges.unit}"
+    title   = f"Galactic | nside={NSIDE} | E={e_str} | N={interface._n_events:,}{bkg_str} | Iteration {len(image_decon.results)}"
+
     hp.projview(
         model_map,
-        title="Galactic Coordinates",
-        unit="arb",
+        title=title,
+        unit=r"cm$^{-2}$ s$^{-1}$ sr$^{-1}$",
         cmap="viridis",
         coord="G",
         graticule=True,
         graticule_labels=True,
         longitude_grid_spacing=30,
-        latitude_grid_spacing=25,
-        min=0.0,
+        latitude_grid_spacing=30,
+        rot=rot,
+        norm='log',
+        min=1e-8,
         max=np.max(model_map),
     )
+ 
+    os.makedirs(_out_dir, exist_ok=True)
+    fname = title.replace(" | ", "_").replace("[", "").replace("]", "").replace(",", "").replace(" ", "_")
+    plt.savefig(os.path.join(_out_dir, fname + ".png"), dpi=150, bbox_inches="tight")
 
     plt.show()
+
