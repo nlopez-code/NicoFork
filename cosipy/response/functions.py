@@ -101,13 +101,19 @@ def get_spectrum_unit(spectrum):
             case Band_Eflux():
                 spectrum_unit = spectrum.K.unit / spectrum.a.unit
             case _:
-                spectrum_unit = None
-                for pname in ('K', 'k'):
-                    if pname in spectrum.parameters:
-                        spectrum_unit = spectrum.parameters[pname].unit
+                # spectrum_unit = None
+                # for pname in ('K', 'k'):
+                #     if pname in spectrum.parameters:
+                #         spectrum_unit = spectrum.parameters[pname].unit
 
-                if spectrum_unit is None:
-                    raise RuntimeError("Spectrum not yet supported because units are unknown.")
+                # if spectrum_unit is None:
+                #     raise RuntimeError("Spectrum not yet supported because units are unknown.")
+                
+                
+                # ====================================================
+                # NEW: XSPEC additive models, including XS_eqpair
+                # ====================================================
+                    spectrum_unit = 1.0 / (u.keV * u.cm**2 * u.s)
 
     return spectrum_unit
 

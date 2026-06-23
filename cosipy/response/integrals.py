@@ -47,6 +47,26 @@ def get_integral_values(f, x_in, force_quad = False):
 
     x = np.asarray(x_in)
 
+    # MAB //////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    low_bounds = x[:-1]
+    hi_bounds = x[1:]
+
+    # ------------------------------------------------------------
+    # Preferred path for models with their own integral method
+    # e.g. XSPEC/astromodels eqpair
+    # ------------------------------------------------------------
+    if hasattr(f, "_integral"):
+        try:
+            return f._integral(low_bounds, hi_bounds)
+        except TypeError:
+            # Some astromodels functions require explicit parameter values
+            params = [p.value for p in f.parameters.values()]
+            return f._integral(low_bounds, hi_bounds, *params)
+
+
+    # MAB ///////////////////////////////////////////////////////////////////////////////////////////////////
+
     # Functions with discontinuities either give inaccurate results or
     # fail altogether with adaptive quadrature.
     if force_quad and \
@@ -156,31 +176,87 @@ def get_integral_values(f, x_in, force_quad = False):
         case _:
             return integral_generic(f, x)
 
-def integral_generic(f, x):
-    """
-    Compute the integral of a function f between the specified
-    endpoints using adaptive quadrature
 
-    Inputs
-    ------
-    f : function of type float -> float
-    x : array of float
-      array of monotonically increasing grid points; integration is
-      performed between each successive pair of points
+# def integral_generic(f, x):
+#     """
+#     Compute the integral of a function f between the specified
+#     endpoints using adaptive quadrature
+
+#     Inputs
+#     ------
+#     f : function of type float -> float
+#     x : array of float
+#       array of monotonically increasing grid points; integration is
+#       performed between each successive pair of points
+
+#     Returns
+#     -------
+#     array of |x|-1 values containing definite integral values
+#     between each successive pair of points in x
+
+#     """
+
+#     from scipy import integrate
+
+#     return np.array([
+#         integrate.quad(f, xl, xh)[0] for
+#         xl, xh in zip(x[:-1], x[1:])
+#     ])
+
+# MAB //////////////////////////////////////////////////////////////////////////////////////////////////////
+
+def integral_generic(f, x, n_sub=64, floor=0.0):
+    """
+    Stable numerical integration of a spectral model over energy bins.
+
+    Parameters
+    ----------
+    f : callable
+        Spectral model f(E), usually differential flux.
+    x : array-like
+        Energy bin edges.
+    n_sub : int
+        Number of internal sample points per bin.
+    floor : float
+        Minimum allowed spectral value.
 
     Returns
     -------
-    array of |x|-1 values containing definite integral values
-    between each successive pair of points in x
-
+    np.ndarray
+        Integrated flux in each energy bin.
     """
 
-    from scipy import integrate
+    x = np.asarray(x, dtype=float)
+    out = np.zeros(len(x) - 1, dtype=float)
 
-    return np.array([
-        integrate.quad(f, xl, xh)[0] for
-        xl, xh in zip(x[:-1], x[1:])
-    ])
+    for i, (xl, xh) in enumerate(zip(x[:-1], x[1:])):
+
+        if not np.isfinite(xl) or not np.isfinite(xh) or xh <= xl:
+            out[i] = 0.0
+            continue
+
+        # Use log spacing for positive energy bins
+        if xl > 0:
+            e = np.geomspace(xl, xh, n_sub)
+        else:
+            e = np.linspace(xl, xh, n_sub)
+
+        try:
+            y = f(e)
+        except Exception:
+            # Fallback to scalar evaluation
+            y = np.array([f(ee) for ee in e])
+
+        y = np.asarray(y, dtype=float)
+
+        # Clean bad model values
+        y[~np.isfinite(y)] = 0.0
+        y[y < floor] = floor
+
+        out[i] = np.trapezoid(y, e)
+
+    return out
+# MAB //////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
 def integral_powerlaw(x, b, p, c):
