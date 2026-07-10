@@ -83,8 +83,11 @@ class MaxStepAccelerator(AcceleratorBase):
             bkg_expectation_list = dataset.calc_bkg_expectation_list(new_dict_bkg_norm)
             expectation_list     = dataset.combine_expectation_list(source_expectation_list, bkg_expectation_list)
 
-            ll_accel = np.sum(dataset.calc_log_likelihood_list(expectation_list))
-            ll_after = np.sum(dataset.calc_log_likelihood_list(after.expectation_list))
+            # Each likelihood must be paired with the model its expectation came
+            # from: unbinned interfaces derive <N_tot> from the model, and the
+            # accelerated and unaccelerated models predict different totals.
+            ll_accel = np.sum(dataset.calc_log_likelihood_list(expectation_list, new_model, new_dict_bkg_norm))
+            ll_after = np.sum(dataset.calc_log_likelihood_list(after.expectation_list, after.model, after.dict_bkg_norm))
 
             if ll_accel < ll_after:
                 logger.debug(

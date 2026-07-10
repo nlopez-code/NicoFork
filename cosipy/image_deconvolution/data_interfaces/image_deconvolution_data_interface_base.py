@@ -186,7 +186,7 @@ class ImageDeconvolutionDataInterfaceBase(ABC):
         raise NotImplementedError
     
     @abstractmethod
-    def calc_log_likelihood(self, expectation):
+    def calc_log_likelihood(self, expectation, model = None, dict_bkg_norm = None):
         """
         Calculate log-likelihood from given expected counts or model/expectation.
 
@@ -194,6 +194,13 @@ class ImageDeconvolutionDataInterfaceBase(ABC):
         ----------
         expectation : :py:class:`histpy.Histogram`
             Expected count histogram.
+        model : :py:class:`histpy.Histogram` or array, optional
+            Model the expectation was produced from. Binned interfaces recover
+            the total expected counts by summing ``expectation`` and ignore
+            this; unbinned interfaces hold per-event densities, whose sum is
+            not the total, and need the model to compute it.
+        dict_bkg_norm : dict, optional
+            Background normalizations used to produce ``expectation``.
 
         Returns
         -------

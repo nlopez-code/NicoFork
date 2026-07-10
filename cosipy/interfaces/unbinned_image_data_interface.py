@@ -15,7 +15,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
-
+2
 
 class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
     """
@@ -430,20 +430,53 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         i = self._bkg_names.index(key)
         return float(np.dot(self.response_matrix[self._n_sky + i, :], data_vec))
 
-    def calc_log_likelihood(self, expectation):
-        """Unbinned Poisson log-likelihood: sum_i ln(lambda_i) - N_expected.
+    def calc_expected_counts(self, model, dict_bkg_norm=None):
+        """Total expected counts <N_tot>, the integral of lambda over the data space.
 
-        The expected total counts is approximated by n_events, which is exact
-        at the RL fixed point (RL conserves counts); the constant offset is
-        irrelevant for convergence monitoring.  Note that summing the
-        per-event densities lambda_i would NOT give the integral term.
+        Summing the per-event densities lambda_i does NOT give this integral.
+        It instead factorizes over the model, because P(x | sky pixel j) is
+        normalized over the data space:
+
+            <N_tot> = sum_j exposure_j * m_j  +  sum_k norm_k * total_bkg_k
+
+        The sky term uses the exposure map (A_eff * livetime * dOmega_pix),
+        which is also the RL M-step denominator.  The background totals are
+        already absolute expected counts, so a norm of 1.0 contributes the
+        model-predicted counts.
+        """
+        arr = self._coerce_model(model)
+
+        exposure = self.exposure_map.contents
+        if hasattr(exposure, 'value'):
+            exposure = exposure.value
+        exposure = np.asarray(exposure, dtype=float)[self._pix_array, 0]
+
+        n_tot = float(np.dot(exposure, arr))
+        for key in self._bkg_names:
+            norm = dict_bkg_norm.get(key, 1.0) if dict_bkg_norm else 1.0
+            n_tot += norm * self._summed_bkg_models[key]
+        return n_tot
+
+    def calc_log_likelihood(self, expectation, model=None, dict_bkg_norm=None):
+        """Unbinned Poisson log-likelihood: -<N_tot> + sum_i ln(lambda_i).
+
+        lambda_i = <N_tot> * Prob(x_i) is the per-event intensity density held
+        in ``expectation``, so only the integral term needs the model.
+
+        When ``model`` is omitted <N_tot> falls back to n_events.  That is exact
+        only at the RL fixed point, where counts are conserved; away from it the
+        error varies from iteration to iteration, so likelihood *differences* --
+        which drive the stopping criterion and the accelerator's accept/reject
+        test -- come out wrong.  Callers holding the model should pass it.
         """
         if isinstance(expectation, Histogram):
             arr = expectation.contents.flatten()
         else:
             arr = np.asarray(expectation, dtype=float).flatten()
-        arr = np.where(arr <= 0, 1e-12, arr)
-        return float(np.sum(np.log(arr)) - self._n_events)
+        arr = np.where(arr <= 0, self._ALMOST_ZERO, arr)
+
+        n_tot = self._n_events if model is None else self.calc_expected_counts(model, dict_bkg_norm)
+        return float(np.sum(np.log(arr)) - n_tot)
 
     # ------------------------------------------------------------------
     # Background utilities

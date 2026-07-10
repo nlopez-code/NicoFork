@@ -426,7 +426,7 @@ class DataIF_Parallel(ImageDeconvolutionDataInterfaceBase):
 
         return np.tensordot(dataspace_histogram.contents, self.bkg_model(key).contents, axes = ([0,1,2,3], [0,1,2,3]))
 
-    def calc_log_likelihood(self, expectation):
+    def calc_log_likelihood(self, expectation, model = None, dict_bkg_norm = None):
         """
         Calculate log-likelihood from given expected counts or model/expectation.
 
@@ -434,6 +434,11 @@ class DataIF_Parallel(ImageDeconvolutionDataInterfaceBase):
         ----------
         expectation : :py:class:`histpy.Histogram`
             Expected count histogram.
+        model : optional
+            Unused. ``np.sum(expectation)`` is already the total expected counts
+            for a binned interface. Accepted so the signature matches the base class.
+        dict_bkg_norm : dict, optional
+            Unused, as above.
 
         Returns
         -------

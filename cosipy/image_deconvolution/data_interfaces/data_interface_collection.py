@@ -122,7 +122,7 @@ class DataInterfaceCollection(Sequence):
         ]
 
     # Log-likelihood
-    def calc_log_likelihood_list(self, expectation_list: list) -> list:
+    def calc_log_likelihood_list(self, expectation_list: list, model = None, dict_bkg_norm = None) -> list:
         """
         Calculate a list of log-likelihood from each data in the registered dataset and the corresponding given expected count histogram.
 
@@ -130,6 +130,12 @@ class DataInterfaceCollection(Sequence):
         ----------
         expectation_list : list of :py:class:`histpy.Histogram`
             List of expected count histograms
+        model : :py:class:`histpy.Histogram` or array, optional
+            Model the expectations were produced from. Unbinned interfaces hold
+            per-event densities and cannot recover the total expected counts
+            from ``expectation`` alone; binned ones ignore it.
+        dict_bkg_norm : dict, optional
+            Background normalizations used to produce ``expectation_list``.
 
         Returns
         -------
@@ -137,14 +143,14 @@ class DataInterfaceCollection(Sequence):
             List of Log-likelihood
         """
 
-        return [_to_float(data.calc_log_likelihood(expectation)) for data, expectation in zip(self._dataset, expectation_list)]
+        return [_to_float(data.calc_log_likelihood(expectation, model, dict_bkg_norm)) for data, expectation in zip(self._dataset, expectation_list)]
 
-    def calc_total_log_likelihood(self, expectation_list: list) -> float:
+    def calc_total_log_likelihood(self, expectation_list: list, model = None, dict_bkg_norm = None) -> float:
         """
         Convenience: sum of all per-dataset log-likelihoods.
         """
 
-        return float(np.sum(self.calc_log_likelihood_list(expectation_list)))
+        return float(np.sum(self.calc_log_likelihood_list(expectation_list, model, dict_bkg_norm)))
 
     # Response-transpose products
     def calc_summed_T_product(self, dataspace_histogram_list: list):

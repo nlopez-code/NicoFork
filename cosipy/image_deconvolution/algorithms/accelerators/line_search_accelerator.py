@@ -132,7 +132,7 @@ class LineSearchAccelerator(AcceleratorBase):
             ]
             bkg_exp_list  = dataset.calc_bkg_expectation_list(new_dict_bkg_norm)
             exp_list      = dataset.combine_expectation_list(src_exp_list, bkg_exp_list)
-            return float(np.sum(dataset.calc_log_likelihood_list(exp_list)))
+            return float(np.sum(dataset.calc_log_likelihood_list(exp_list, new_model, new_dict_bkg_norm)))
 
         def _ll_2d(alpha_m, alpha_b):
             """LH as a function of independent model and bkg accel_factors."""
@@ -146,7 +146,7 @@ class LineSearchAccelerator(AcceleratorBase):
             ]
             bkg_exp_list = dataset.calc_bkg_expectation_list(new_dict_bkg_norm)
             exp_list     = dataset.combine_expectation_list(src_exp_list, bkg_exp_list)
-            return float(np.sum(dataset.calc_log_likelihood_list(exp_list)))
+            return float(np.sum(dataset.calc_log_likelihood_list(exp_list, new_model, new_dict_bkg_norm)))
 
         # --- run line search ---
 

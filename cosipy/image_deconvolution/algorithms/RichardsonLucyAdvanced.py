@@ -215,7 +215,7 @@ class RichardsonLucyAdvanced(RichardsonLucy):
         # always recompute expectation and LH after _ensure_model_constraints
         self.Estep()
         logger.debug("Expected count histograms updated.")
-        self.log_likelihood_list = self.dataset.calc_log_likelihood_list(self.expectation_list)
+        self.log_likelihood_list = self.dataset.calc_log_likelihood_list(self.expectation_list, self.model, self.dict_bkg_norm)
         logger.debug("Log-likelihood list updated.")
 
     def register_result(self):
