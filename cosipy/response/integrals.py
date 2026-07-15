@@ -156,8 +156,10 @@ def get_integral_values(f, x_in, force_quad = False):
 
         
         case _:
-            
-            return integral_generic_XSPEC(f, x)
+            if is_xspec_model(f):
+                return integral_generic_XSPEC(f, x)
+
+    return integral_generic(f, x)
 
 
 def integral_generic(f, x):
@@ -239,6 +241,15 @@ def integral_generic_XSPEC(f, x, n_sub=64, floor=0.0):
         out[i] = np.trapezoid(y, e)
 
     return out
+
+def is_xspec_model(f):
+    class_name = f.__class__.__name__
+    description = getattr(f, "description", "")
+
+    return (
+        class_name.startswith("XS_")
+        or "XS_" in description
+    )
 # MAB //////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
