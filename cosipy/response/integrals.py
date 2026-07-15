@@ -47,26 +47,7 @@ def get_integral_values(f, x_in, force_quad = False):
 
     x = np.asarray(x_in)
 
-    # MAB //////////////////////////////////////////////////////////////////////////////////////////////////////
-
-    low_bounds = x[:-1]
-    hi_bounds = x[1:]
-
-    # ------------------------------------------------------------
-    # Preferred path for models with their own integral method
-    # e.g. XSPEC/astromodels eqpair
-    # ------------------------------------------------------------
-    if hasattr(f, "_integral"):
-        try:
-            return f._integral(low_bounds, hi_bounds)
-        except TypeError:
-            # Some astromodels functions require explicit parameter values
-            params = [p.value for p in f.parameters.values()]
-            return f._integral(low_bounds, hi_bounds, *params)
-
-
-    # MAB ///////////////////////////////////////////////////////////////////////////////////////////////////
-
+    
     # Functions with discontinuities either give inaccurate results or
     # fail altogether with adaptive quadrature.
     if force_quad and \
@@ -173,43 +154,41 @@ def get_integral_values(f, x_in, force_quad = False):
                                          f.upper_bound.value,
                                          f.value.value)
 
-        case "_integral":
-
-            return integral_generic_XSPEC(f, x)
         
         case _:
+            
             return integral_generic(f, x)
 
 
-def integral_generic(f, x):
-    """
-    Compute the integral of a function f between the specified
-    endpoints using adaptive quadrature
+# def integral_generic(f, x):
+#     """
+#     Compute the integral of a function f between the specified
+#     endpoints using adaptive quadrature
 
-    Inputs
-    ------
-    f : function of type float -> float
-    x : array of float
-      array of monotonically increasing grid points; integration is
-      performed between each successive pair of points
+#     Inputs
+#     ------
+#     f : function of type float -> float
+#     x : array of float
+#       array of monotonically increasing grid points; integration is
+#       performed between each successive pair of points
 
-    Returns
-    -------
-    array of |x|-1 values containing definite integral values
-    between each successive pair of points in x
+#     Returns
+#     -------
+#     array of |x|-1 values containing definite integral values
+#     between each successive pair of points in x
 
-    """
+#     """
 
-    from scipy import integrate
+#     from scipy import integrate
 
-    return np.array([
-        integrate.quad(f, xl, xh)[0] for
-        xl, xh in zip(x[:-1], x[1:])
-    ])
+#     return np.array([
+#         integrate.quad(f, xl, xh)[0] for
+#         xl, xh in zip(x[:-1], x[1:])
+#     ])
 
 # MAB //////////////////////////////////////////////////////////////////////////////////////////////////////
 
-def integral_generic_XSPEC(f, x, n_sub=64, floor=0.0):
+def integral_generic(f, x, n_sub=64, floor=0.0):
     """
     Stable numerical integration of a spectral model over energy bins.
 
