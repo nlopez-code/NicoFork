@@ -157,38 +157,38 @@ def get_integral_values(f, x_in, force_quad = False):
         
         case _:
             
-            return integral_generic(f, x)
+            return integral_generic_XSPEC(f, x)
 
 
-# def integral_generic(f, x):
-#     """
-#     Compute the integral of a function f between the specified
-#     endpoints using adaptive quadrature
+def integral_generic(f, x):
+    """
+    Compute the integral of a function f between the specified
+    endpoints using adaptive quadrature
 
-#     Inputs
-#     ------
-#     f : function of type float -> float
-#     x : array of float
-#       array of monotonically increasing grid points; integration is
-#       performed between each successive pair of points
+    Inputs
+    ------
+    f : function of type float -> float
+    x : array of float
+      array of monotonically increasing grid points; integration is
+      performed between each successive pair of points
 
-#     Returns
-#     -------
-#     array of |x|-1 values containing definite integral values
-#     between each successive pair of points in x
+    Returns
+    -------
+    array of |x|-1 values containing definite integral values
+    between each successive pair of points in x
 
-#     """
+    """
 
-#     from scipy import integrate
+    from scipy import integrate
 
-#     return np.array([
-#         integrate.quad(f, xl, xh)[0] for
-#         xl, xh in zip(x[:-1], x[1:])
-#     ])
+    return np.array([
+        integrate.quad(f, xl, xh)[0] for
+        xl, xh in zip(x[:-1], x[1:])
+    ])
 
 # MAB //////////////////////////////////////////////////////////////////////////////////////////////////////
 
-def integral_generic(f, x, n_sub=64, floor=0.0):
+def integral_generic_XSPEC(f, x, n_sub=64, floor=0.0):
     """
     Stable numerical integration of a spectral model over energy bins.
 
