@@ -327,7 +327,7 @@ class DataIF_COSI_DC2(ImageDeconvolutionDataInterfaceBase):
         return np.dot(dataspace_histogram.contents.ravel(),
                       self.bkg_model(key).contents.ravel())
 
-    def calc_log_likelihood(self, expectation, model = None, dict_bkg_norm = None):
+    def calc_log_likelihood(self, expectation):
         """
         Calculate log-likelihood from given expected counts or model/expectation.
 
@@ -335,11 +335,6 @@ class DataIF_COSI_DC2(ImageDeconvolutionDataInterfaceBase):
         ----------
         expectation : :py:class:`histpy.Histogram`
             Expected count histogram.
-        model : optional
-            Unused. ``np.sum(expectation)`` is already the total expected counts
-            for a binned interface. Accepted so the signature matches the base class.
-        dict_bkg_norm : dict, optional
-            Unused, as above.
 
         Returns
         -------
