@@ -18,6 +18,12 @@ class RelativeCDSCoordinates:
         Parameters
         ----------
         source_direction: SkyCoord or normalized vector (3,N)
+            If a SkyCoord, it is transformed to ``pol_convention.frame``
+            before computing the local polarization basis, so any frame
+            is accepted.
+            If a bare vector, NO frame transform is performed -- it is
+            taken as-is and assumed to already be expressed in
+            ``pol_convention.frame``.
         pol_convention
         """
 
