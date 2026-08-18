@@ -133,8 +133,9 @@ class RelativeCDSCoordinates:
         -------
         phi,az:
         phi: Angular distance with respect to the source direction.
+            Range [0, pi] .
         az: Azimuthal angle around the source direction, with a
-            0-direction defined by the polarization convention.
+            0-direction defined by the polarization convention. Range is (-pi, pi]
         Each with shape (N,M). Angles.
 
         """
