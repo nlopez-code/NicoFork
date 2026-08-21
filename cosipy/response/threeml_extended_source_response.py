@@ -1,4 +1,4 @@
-import copy
+from copy import copy as shallow_copy, deepcopy
 
 from astromodels.sources import Source, ExtendedSource
 
@@ -112,7 +112,7 @@ class BinnedThreeMLExtendedSourceResponse(BinnedThreeMLSourceResponseInterface):
         -------
         A copy than can be used safely to convolve another source
         """
-        new = copy.copy(self)
+        new = shallow_copy(self)
         new.clear_cache()
         return new
 
@@ -155,7 +155,7 @@ class BinnedThreeMLExtendedSourceResponse(BinnedThreeMLSourceResponseInterface):
         # not the GALPROP file-version selector. Include it in the local cache
         # key so set_version() invalidates the expectation cache correctly.
         if is_galprop:
-            source_dict = copy.deepcopy(source_dict)
+            source_dict = deepcopy(source_dict)
             source_dict["_cosipy_galprop_version"] = self._source.spatial_shape._gal_version
 
         #coord = self._source.position.sky_coord
@@ -241,7 +241,7 @@ class BinnedThreeMLExtendedSourceResponse(BinnedThreeMLSourceResponseInterface):
                 self._spatial_response = (
                     self._esr.get_spatial_response_from_astromodel(self._source)
                 )
-                self._last_spatial_model_dict = copy.deepcopy(spatial_model_dict)
+                self._last_spatial_model_dict = deepcopy(spatial_model_dict)
 
                 logger.info("--> spatial response convolution done")
 
