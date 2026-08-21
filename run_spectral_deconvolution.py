@@ -1,7 +1,6 @@
 import os
 import re
 import numpy as np
-import healpy as hp
 import matplotlib.pyplot as plt
 import yaml
 
@@ -12,7 +11,7 @@ from histpy import Histogram
 from cosipy.data_io.EmCDSUnbinnedData import TimeTagEmCDSEventDataInSCFrameFromArrays
 from cosipy.response.ml import NFResponse, UnpolarizedNFFarFieldInstrumentResponseFunction
 from cosipy.background_estimation.ml import FreeNormNFUnbinnedBackground, NFBackground
-from cosipy.image_deconvolution.unbinned_image_data_interface import UnbinnedImageDataInterface
+from cosipy.image_deconvolution.unbinned_spectral_data_interface import UnbinnedSpectralDataInterface
 from cosipy.image_deconvolution.image_deconvolution import ImageDeconvolution
 from cosipy.image_deconvolution.data_interfaces.data_interface_collection import DataInterfaceCollection
 
@@ -31,23 +30,21 @@ FITS_PATHS  = [
             ]
 
 NF_RSP_PATH = "unpolarized_nfresponse_v1-00.pt"
-LOAD_PKL    = False           # set True to skip rebuild and load cached interface
+LOAD_PKL    = True           # set True to skip rebuild and load cached interface
 
 N_EVENTS    = None         # None = full dataset; int = evenly-spaced subsample
 
-NSIDE       =  4            # sky model HEALPix resolution (change in YAML too)
+NSIDE       =  2            # sky-integration HEALPix resolution (NOT a model axis)
 
-# Marker for reference position (set to None to disable)
-MARKER_LON_DEG = None
-MARKER_LAT_DEG = None
-
-rot = (MARKER_LON_DEG, MARKER_LAT_DEG) if MARKER_LON_DEG is not None else None
-
-# Energy window is read from the YAML file.
-with open("deconvolution_params.yaml") as _f:
+# Energy window and model binning are read from the YAML file.
+with open("spectral_deconvolution_params.yaml") as _f:
     _params = yaml.safe_load(_f)
 E_MIN_KEV = _params["energy_filter"]["min_keV"]
 E_MAX_KEV = _params["energy_filter"]["max_keV"]
+N_EBINS   = _params["energy_filter"]["n_bins"]
+
+# Log-spaced model incident-energy bin edges spanning the energy window.
+ENERGY_EDGES = np.geomspace(E_MIN_KEV, E_MAX_KEV, N_EBINS + 1)
 
 # Background — provide exactly one of these:
 #   BKG_NF_PATH  : path to an NFBackground model (.pt) + SC_FILE_PATH for SpacecraftHistory
@@ -61,21 +58,21 @@ _n_str   = re.sub(r'e\+?0*(\d+)', r'e\1', f"{N_EVENTS:.0e}") if N_EVENTS is not 
 _bkg     = "" if (BKG_NF_PATH is not None or BKG_PATH is not None) else "nb"
 _subdir  = "composites" if len(FITS_PATHS) > 1 else ""
 _pkl_dir = os.path.join("Jar of Pickles", _subdir) if _subdir else "Jar of Pickles"
-_out_dir = os.path.join("Deconvolved Models", _subdir) if _subdir else "Deconvolved Models"
-PKL_PATH = os.path.join(_pkl_dir, f"ns{NSIDE}e{int(E_MIN_KEV)}{int(E_MAX_KEV)}n{_n_str}{_bkg}.pkl")
+_out_dir = os.path.join("Deconvolved Spectra", _subdir) if _subdir else "Deconvolved Spectra"
+PKL_PATH = os.path.join(_pkl_dir, f"spec_ns{NSIDE}e{int(E_MIN_KEV)}{int(E_MAX_KEV)}nb{N_EBINS}n{_n_str}{_bkg}.pkl")
 
 if __name__ == '__main__':
     # ============================================================
     # Load or build the interface
     # ============================================================
     if LOAD_PKL:
-        interface = UnbinnedImageDataInterface.load(PKL_PATH)
+        interface = UnbinnedSpectralDataInterface.load(PKL_PATH)
 
         if BKG_PATH is not None:
             print("Building background model from binned estimate...")
             hist = Histogram.open(BKG_PATH)
             projected = hist.project(['Em', 'Phi', 'PsiChi'])
-            bkg_rates = UnbinnedImageDataInterface.background_rates_from_binned_estimate(
+            bkg_rates = UnbinnedSpectralDataInterface.background_rates_from_binned_estimate(
                 projected, interface._events
             )
             interface.add_background_model('sky_model', bkg_rates)
@@ -132,7 +129,7 @@ if __name__ == '__main__':
             print("Building background model from binned estimate...")
             hist = Histogram.open(BKG_PATH)
             projected = hist.project(['Em', 'Phi', 'PsiChi'])
-            bkg_rates = UnbinnedImageDataInterface.background_rates_from_binned_estimate(
+            bkg_rates = UnbinnedSpectralDataInterface.background_rates_from_binned_estimate(
                 projected, events
             )
             background_models['sky_model'] = bkg_rates
@@ -140,12 +137,12 @@ if __name__ == '__main__':
 
         # --- Build interface and response matrix ---
         print("Building response matrix...")
-        interface = UnbinnedImageDataInterface(
+        interface = UnbinnedSpectralDataInterface(
             irf               = irf,
             events            = events,
-            nside             = NSIDE,
+            energy_edges      = ENERGY_EDGES,
             sc_history        = sc_history,
-            energy_edges      = [505.0, 517.0],
+            nside             = NSIDE,
             background_models = background_models or None,
         )
         _ = interface.response_matrix  # trigger build
@@ -156,50 +153,52 @@ if __name__ == '__main__':
     # ============================================================
     # Run deconvolution
     # ============================================================
-    dataset     = DataInterfaceCollection([interface])
-    image_decon = ImageDeconvolution()
-    image_decon.set_dataset(dataset)
-    image_decon.read_parameterfile("deconvolution_params.yaml")
+    dataset      = DataInterfaceCollection([interface])
+    spectr_decon = ImageDeconvolution()
+    spectr_decon.set_dataset(dataset)
+    spectr_decon.read_parameterfile("spectral_deconvolution_params.yaml")
 
-    # Sync energy edges from the interface (min/max of event data) so the
-    # YAML doesn't need to be updated manually when the dataset changes.
+    # Sync energy edges from the interface so the YAML doesn't need to be
+    # updated manually when the binning changes.
     edges = interface.energy_edges
-    image_decon.override_parameter(
+    spectr_decon.override_parameter(
         f"model_definition:property:energy_edges:value = {edges.value.tolist()}",
         f"model_definition:property:energy_edges:unit = {str(edges.unit)}",
     )
 
-    image_decon.initialize()
-    image_decon.run_deconvolution()
+    spectr_decon.initialize()
+    spectr_decon.run_deconvolution()
 
-    final_model = image_decon.results[-1]['model']
-    model_map   = (final_model.contents[:, 0]).value
+    final_model = spectr_decon.results[-1]['model']
+    spectrum    = final_model.contents.value  # cm^-2 s^-1 keV^-1 sr^-1, sky-averaged
+    e_edges     = final_model.axes['Ei'].edges.value
+    e_mids      = np.sqrt(e_edges[:-1] * e_edges[1:])
+
+    # Sky-integrated differential flux (uniform-emission model → × 4π sr)
+    spectrum_sky = spectrum * 4 * np.pi
 
     has_bkg = BKG_NF_PATH is not None or BKG_PATH is not None
     bkg_str = " | bkg" if has_bkg else " | no bkg"
-    e_edges = interface.energy_edges
-    e_str   = f"[{e_edges.value[0]:.0f}, {e_edges.value[-1]:.0f}] {e_edges.unit}"
-    title   = f"Galactic | nside={NSIDE} | E={e_str} | N={interface._n_events:,}{bkg_str} | Iteration {len(image_decon.results)}"
+    e_str   = f"[{e_edges[0]:.0f}, {e_edges[-1]:.0f}] keV"
+    title   = f"Sky Spectrum | E={e_str} | {N_EBINS} bins | N={interface._n_events:,}{bkg_str} | Iteration {len(spectr_decon.results)}"
 
-    hp.projview(
-        model_map,
-        title=title,
-        unit=r"cm$^{-2}$ s$^{-1}$ sr$^{-1}$",
-        cmap="plasma",
-        coord="G",
-        graticule=True,
-        graticule_labels=True,
-        longitude_grid_spacing=30,
-        latitude_grid_spacing=30,
-        rot=rot,
-        norm='log',
-        min=1e-5,
-        max=np.max(model_map),
-    )
- 
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.stairs(spectrum_sky, e_edges, fill=False, linewidth=2)
+    ax.plot(e_mids, spectrum_sky, 'o', markersize=4)
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('Incident energy [keV]')
+    ax.set_ylabel(r'Sky-integrated flux [ph cm$^{-2}$ s$^{-1}$ keV$^{-1}$]')
+    ax.set_title(title, fontsize=10)
+    ax.grid(True, which='both', alpha=0.3)
+
+    if has_bkg:
+        bkg_norms = spectr_decon.results[-1]['background_normalization']
+        norm_str = ", ".join(f"{k}: {v:.3f}" for k, v in bkg_norms.items())
+        ax.text(0.02, 0.02, f"bkg norm — {norm_str}", transform=ax.transAxes, fontsize=8)
+
     os.makedirs(_out_dir, exist_ok=True)
     fname = title.replace(" | ", "_").replace("[", "").replace("]", "").replace(",", "").replace(" ", "_")
     plt.savefig(os.path.join(_out_dir, fname + ".png"), dpi=150, bbox_inches="tight")
 
     plt.show()
-

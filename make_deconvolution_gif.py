@@ -22,7 +22,7 @@ from cosipy.image_deconvolution.data_interfaces.data_interface_collection import
 # Configuration
 # ============================================================
 COMPOSITE   = False              # set True when PKL came from a multi-file run
-PKL_NAME    = "composites/ns16e505517nall.pkl"
+PKL_NAME    = "ns2e505517nall.pkl"
 PARAMS_YAML = "deconvolution_params.yaml"
 
 _subdir    = "composites" if COMPOSITE else ""
@@ -58,7 +58,7 @@ def _render_frame(model_map, iteration):
     """Render one iteration to a matplotlib figure and return it."""
     rot = (MARKER_LON_DEG, MARKER_LAT_DEG) if MARKER_LON_DEG is not None else None
     if LOG_SCALE:
-        vmin = max(float(model_map[model_map > 0].min()), float(model_map.max()) * 1e-4)
+        vmin = 1e-5 #max(float(model_map[model_map > 0].min()), float(model_map.max()) * 1e-4)
         norm = 'log'
     else:
         vmin = 0.0
