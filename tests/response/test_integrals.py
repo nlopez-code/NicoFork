@@ -14,6 +14,7 @@ from astromodels import (
     Band_grbm,
     Powerlaw,
     Cutoff_powerlaw,
+    Super_cutoff_powerlaw,
     Gaussian,
     DiracDelta,
     StepFunction,
@@ -22,8 +23,10 @@ from astromodels import (
 )
 
 from cosipy.threeml.custom_functions import Band_Eflux
+from cosipy.threeml import BinnedSED10
 
 from cosipy.response.integrals import get_integral_values
+
 
 def test_integrate():
 
@@ -189,3 +192,37 @@ def test_integrate():
 
     v = get_integral_values(delta, x, force_quad=True) # ignored for Delta
     assert np.allclose(v, v0)
+
+
+def test_super_cutoff_powerlaw_integral():
+    spectrum = Super_cutoff_powerlaw()
+    spectrum.K.value = 1e-6
+    spectrum.piv.value = 1000.0
+    spectrum.index.value = 0.3
+    spectrum.xc.value = 900.0
+    spectrum.gamma.value = 1.1
+
+    x = np.geomspace(100.0, 10000.0, 13)
+
+    v = get_integral_values(spectrum, x)
+    v_q = get_integral_values(spectrum, x, force_quad=True)
+
+    assert np.allclose(v, v_q, rtol=1e-8, atol=1e-14)
+
+
+def test_binned_sed10_integral():
+    spectrum = BinnedSED10()
+    x = np.geomspace(100.0, 10000.0, 11)
+
+    for i, edge in enumerate(x):
+        getattr(spectrum, f"E{i}").value = float(edge)
+
+    spectrum.index.value = -2.0
+
+    for i in range(10):
+        getattr(spectrum, f"K{i}").value = 1e-6 * (i + 1)
+
+    v = get_integral_values(spectrum, x)
+    v_q = get_integral_values(spectrum, x, force_quad=True)
+
+    assert np.allclose(v, v_q, rtol=1e-8, atol=1e-14)
