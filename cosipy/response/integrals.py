@@ -17,7 +17,7 @@ from astromodels import (
     Quartic,
 )
 
-from cosipy.threeml import Band_Eflux, BinnedSED10
+from cosipy.threeml import Band_Eflux, BinnedSED
 
 
 def get_integral_values(f, x_in, force_quad=False):
@@ -77,8 +77,8 @@ def get_integral_values(f, x_in, force_quad=False):
                                               f.gamma.value,
                                               f.K.value)
 
-        case BinnedSED10():
-            return integral_binned_sed10(f, x)
+        case BinnedSED():
+            return integral_binned_sed(f, x)
 
         case Band():
             return integral_band(x,
@@ -353,9 +353,9 @@ def integral_super_co_powerlaw(x, a, p, c, g, K):
     )
 
 
-def integral_binned_sed10(f, x):
+def integral_binned_sed(f, x):
     """
-    Compute exact integrals of a ``BinnedSED10`` between successive edges.
+    Compute exact integrals of a ``BinnedSED`` between successive edges.
     """
 
     return np.array([

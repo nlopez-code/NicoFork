@@ -23,7 +23,7 @@ from astromodels import (
 )
 
 from cosipy.threeml.custom_functions import Band_Eflux
-from cosipy.threeml import BinnedSED10
+from cosipy.threeml import BinnedSED
 
 from cosipy.response.integrals import get_integral_values
 
@@ -210,17 +210,25 @@ def test_super_cutoff_powerlaw_integral():
     assert np.allclose(v, v_q, rtol=1e-8, atol=1e-14)
 
 
-def test_binned_sed10_integral():
-    spectrum = BinnedSED10()
-    x = np.geomspace(100.0, 10000.0, 11)
+def test_binned_sed_integral():
+    from types import SimpleNamespace
+    import astropy.units as u
 
-    for i, edge in enumerate(x):
-        getattr(spectrum, f"E{i}").value = float(edge)
+    x = np.geomspace(100.0, 10000.0, 7)
+    response = SimpleNamespace(
+        axes={
+            "Ei": SimpleNamespace(
+                edges=x * u.keV,
+                nbins=len(x) - 1,
+            )
+        }
+    )
 
-    spectrum.index.value = -2.0
-
-    for i in range(10):
-        getattr(spectrum, f"K{i}").value = 1e-6 * (i + 1)
+    spectrum = BinnedSED.from_response(
+        response,
+        initial_fluxes=1e-6 * np.arange(1, len(x)),
+        index=-2.0,
+    )
 
     v = get_integral_values(spectrum, x)
     v_q = get_integral_values(spectrum, x, force_quad=True)

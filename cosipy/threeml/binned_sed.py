@@ -1,13 +1,16 @@
 """
-Astromodels spectral function for a fixed 10-bin true-energy SED.
+Response-configured, arbitrary-bin true-energy SED model for COSI/3ML.
 
-Each bin is represented by a local power law
+The public entry point is ``BinnedSED.from_response``.  It creates an
+astromodels ``Function1D`` with one independent normalization K_i for each
+selected response true-energy bin.  The selected bins must be contiguous.
+
+Within bin i,
 
     dN/dE = K_i * (E / E_piv,i)**index
 
-with E_piv,i = sqrt(E_i * E_{i+1}).  The ten normalizations K0...K9
-are independent fit parameters, while E0...E10 and the local index are
-normally fixed from the COSI true-energy response.
+with E_piv,i = sqrt(E_i * E_{i+1}).  The bin edges and common local index are
+fixed, while the K_i values are free fit parameters.
 """
 
 import numpy as np
@@ -16,245 +19,241 @@ import astropy.units as u
 from astromodels.functions.function import Function1D, FunctionMeta
 
 
-__all__ = ["BinnedSED10"]
+__all__ = ["BinnedSED"]
 
 
-class BinnedSED10(Function1D, metaclass=FunctionMeta):
-    r"""
-    description :
-        Ten-bin piecewise power-law SED in true energy. Each bin has an
-        independent differential normalization at its geometric-center pivot.
-    latex : $K_i (E/E_{\mathrm{piv},i})^{\alpha}$
-    parameters :
-        K0 :
-            desc : Differential normalization in true-energy bin 0
-            initial value : 1e-6
-            is_normalization : True
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K1 :
-            desc : Differential normalization in true-energy bin 1
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K2 :
-            desc : Differential normalization in true-energy bin 2
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K3 :
-            desc : Differential normalization in true-energy bin 3
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K4 :
-            desc : Differential normalization in true-energy bin 4
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K5 :
-            desc : Differential normalization in true-energy bin 5
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K6 :
-            desc : Differential normalization in true-energy bin 6
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K7 :
-            desc : Differential normalization in true-energy bin 7
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K8 :
-            desc : Differential normalization in true-energy bin 8
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
-        K9 :
-            desc : Differential normalization in true-energy bin 9
-            initial value : 1e-6
-            min : 0
-            max : 1e-2
-            delta : 1e-7
+_BINNED_SED_CLASSES = {}
 
-        E0 :
-            desc : Lower edge of SED bin 0
-            initial value : 1
-            fix : yes
-        E1 :
-            desc : Edge between SED bins 0 and 1
-            initial value : 2
-            fix : yes
-        E2 :
-            desc : Edge between SED bins 1 and 2
-            initial value : 3
-            fix : yes
-        E3 :
-            desc : Edge between SED bins 2 and 3
-            initial value : 4
-            fix : yes
-        E4 :
-            desc : Edge between SED bins 3 and 4
-            initial value : 5
-            fix : yes
-        E5 :
-            desc : Edge between SED bins 4 and 5
-            initial value : 6
-            fix : yes
-        E6 :
-            desc : Edge between SED bins 5 and 6
-            initial value : 7
-            fix : yes
-        E7 :
-            desc : Edge between SED bins 6 and 7
-            initial value : 8
-            fix : yes
-        E8 :
-            desc : Edge between SED bins 7 and 8
-            initial value : 9
-            fix : yes
-        E9 :
-            desc : Edge between SED bins 8 and 9
-            initial value : 10
-            fix : yes
-        E10 :
-            desc : Upper edge of SED bin 9
-            initial value : 11
-            fix : yes
 
-        index :
-            desc : Local power-law index in every SED bin
-            initial value : -2
-            min : -10
-            max : 10
-            fix : yes
+class BinnedSED(Function1D):
+    """
+    Base type for a response-configured arbitrary-bin SED.
+
+    Do not instantiate this class directly. Use ``BinnedSED.from_response``;
+    the number of astromodels parameters must be known when the concrete
+    Function1D class is created.
     """
 
-    def _set_units(self, x_unit, y_unit):
-        # Bin edges are energies.
-        for i in range(11):
+    _n_sed_bins = None
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError(
+            "BinnedSED must be created with BinnedSED.from_response(response, ...)."
+        )
+
+    @classmethod
+    def from_response(
+        cls,
+        response,
+        ei_bin_indices=None,
+        initial_fluxes=None,
+        index=-2.0,
+        default_initial_flux=1e-8,
+    ):
+        """
+        Create and configure a binned SED directly from response Ei bins.
+
+        Parameters
+        ----------
+        response : ExtendedSourceResponse-like
+            Object exposing ``response.axes[\"Ei\"]`` with ``edges`` and
+            ``nbins``.
+        ei_bin_indices : iterable of int, optional
+            Contiguous increasing response Ei-bin indices to use. If omitted,
+            all response Ei bins are used.
+        initial_fluxes : array-like or Quantity, optional
+            Initial K_i values, one per selected response bin. If omitted, the
+            model defaults are retained.
+        index : float, optional
+            Fixed local power-law index in every SED bin. Default is -2.
+        default_initial_flux : float, optional
+            Positive fallback replacing any non-finite or non-positive supplied
+            initial flux. Default is 1e-8.
+
+        Returns
+        -------
+        BinnedSED
+            A concrete astromodels Function1D whose number of K_i and E_i
+            parameters matches the selected response bins.
+        """
+
+        ei_axis = response.axes["Ei"]
+
+        if ei_bin_indices is None:
+            bins = np.arange(ei_axis.nbins, dtype=int)
+        else:
+            bins = np.asarray(list(ei_bin_indices), dtype=int)
+
+        if bins.size == 0:
+            raise ValueError("At least one response Ei bin must be selected.")
+
+        if not np.all(np.diff(bins) == 1):
+            raise ValueError(
+                "Selected response Ei bins must be contiguous and increasing."
+            )
+
+        if bins[0] < 0 or bins[-1] >= ei_axis.nbins:
+            raise IndexError(
+                f"Selected Ei bins must lie in [0, {ei_axis.nbins - 1}]."
+            )
+
+        n_bins = int(bins.size)
+        concrete_class = _get_binned_sed_class(n_bins)
+        spectrum = concrete_class()
+
+        edges = ei_axis.edges
+
+        # COSI response true energies are conventionally keV. When the response
+        # carries explicit units, convert to keV so the numerical parameter
+        # values are ready for the standard astromodels spectral energy unit.
+        if isinstance(edges, u.Quantity):
+            selected_edges = np.asarray(
+                edges[bins[0] : bins[-1] + 2].to_value(u.keV),
+                dtype=float,
+            )
+        else:
+            selected_edges = np.asarray(
+                edges[bins[0] : bins[-1] + 2],
+                dtype=float,
+            )
+
+        if np.any(np.diff(selected_edges) <= 0.0):
+            raise ValueError("Selected response Ei edges are not strictly increasing.")
+
+        for i, edge in enumerate(selected_edges):
+            par = getattr(spectrum, f"E{i}")
+            par.value = float(edge)
+            par.free = False
+
+        spectrum.index.value = float(index)
+        spectrum.index.free = False
+
+        if not np.isfinite(default_initial_flux) or default_initial_flux <= 0.0:
+            raise ValueError("default_initial_flux must be finite and positive.")
+
+        if initial_fluxes is not None:
+            if isinstance(initial_fluxes, u.Quantity):
+                initial_fluxes = initial_fluxes.value
+
+            initial_fluxes = np.asarray(initial_fluxes, dtype=float)
+
+            if initial_fluxes.size != n_bins:
+                raise ValueError(
+                    f"initial_fluxes must contain exactly {n_bins} values."
+                )
+
+            initial_fluxes = np.where(
+                np.isfinite(initial_fluxes) & (initial_fluxes > 0.0),
+                initial_fluxes,
+                float(default_initial_flux),
+            )
+
+            for i, flux in enumerate(initial_fluxes):
+                getattr(spectrum, f"K{i}").value = float(flux)
+
+        for i in range(n_bins):
+            getattr(spectrum, f"K{i}").free = True
+
+        # Convenience metadata used by diagnostics and notebook output.
+        spectrum._cosipy_ei_bin_indices = tuple(int(i) for i in bins)
+
+        return spectrum
+
+    @property
+    def n_bins(self):
+        """Number of SED bins in this concrete spectrum."""
+        return int(self._n_sed_bins)
+
+    @property
+    def bin_edges(self):
+        """Current numerical SED energy edges."""
+        return np.asarray(
+            [getattr(self, f"E{i}").value for i in range(self.n_bins + 1)],
+            dtype=float,
+        )
+
+    @property
+    def pivots(self):
+        """Geometric-center pivot energy of each SED bin."""
+        edges = self.bin_edges
+        return np.sqrt(edges[:-1] * edges[1:])
+
+    @property
+    def normalizations(self):
+        """Tuple containing K0 ... K(N-1) Parameter objects."""
+        return tuple(getattr(self, f"K{i}") for i in range(self.n_bins))
+
+    def _set_units_impl(self, x_unit, y_unit):
+        for i in range(self.n_bins + 1):
             getattr(self, f"E{i}").unit = x_unit
 
-        # Each K_i is a differential flux normalization.
-        for i in range(10):
+        for i in range(self.n_bins):
             getattr(self, f"K{i}").unit = y_unit
 
         self.index.unit = u.dimensionless_unscaled
 
     @staticmethod
     def _value_in_unit(value, unit):
-        """Return a plain numeric value in the requested unit when possible."""
         if isinstance(value, u.Quantity):
             return value.to_value(unit)
         return np.asarray(value, dtype=float)
 
-    def evaluate(
-        self,
-        x,
-        K0, K1, K2, K3, K4,
-        K5, K6, K7, K8, K9,
-        E0, E1, E2, E3, E4, E5,
-        E6, E7, E8, E9, E10,
-        index,
-    ):
-        # astromodels can evaluate with or without astropy quantities.
+    def _evaluate_impl(self, x, kvals_in, edges_in, index):
         x_has_units = isinstance(x, u.Quantity)
 
         if x_has_units:
             xv = np.asarray(x.to_value(self.x_unit), dtype=float)
-            edges = np.array(
-                [
-                    self._value_in_unit(E0, self.x_unit),
-                    self._value_in_unit(E1, self.x_unit),
-                    self._value_in_unit(E2, self.x_unit),
-                    self._value_in_unit(E3, self.x_unit),
-                    self._value_in_unit(E4, self.x_unit),
-                    self._value_in_unit(E5, self.x_unit),
-                    self._value_in_unit(E6, self.x_unit),
-                    self._value_in_unit(E7, self.x_unit),
-                    self._value_in_unit(E8, self.x_unit),
-                    self._value_in_unit(E9, self.x_unit),
-                    self._value_in_unit(E10, self.x_unit),
-                ],
+            edges = np.asarray(
+                [self._value_in_unit(edge, self.x_unit) for edge in edges_in],
                 dtype=float,
             )
-            kvals = np.array(
-                [
-                    self._value_in_unit(K0, self.y_unit),
-                    self._value_in_unit(K1, self.y_unit),
-                    self._value_in_unit(K2, self.y_unit),
-                    self._value_in_unit(K3, self.y_unit),
-                    self._value_in_unit(K4, self.y_unit),
-                    self._value_in_unit(K5, self.y_unit),
-                    self._value_in_unit(K6, self.y_unit),
-                    self._value_in_unit(K7, self.y_unit),
-                    self._value_in_unit(K8, self.y_unit),
-                    self._value_in_unit(K9, self.y_unit),
-                ],
+            kvals = np.asarray(
+                [self._value_in_unit(k, self.y_unit) for k in kvals_in],
                 dtype=float,
             )
         else:
             xv = np.asarray(x, dtype=float)
-            edges = np.asarray(
-                [E0, E1, E2, E3, E4, E5, E6, E7, E8, E9, E10],
-                dtype=float,
-            )
-            kvals = np.asarray(
-                [K0, K1, K2, K3, K4, K5, K6, K7, K8, K9],
-                dtype=float,
-            )
+            edges = np.asarray(edges_in, dtype=float)
+            kvals = np.asarray(kvals_in, dtype=float)
+
+        if np.any(np.diff(edges) <= 0.0):
+            raise ValueError("BinnedSED energy edges must be strictly increasing.")
 
         index_value = float(getattr(index, "value", index))
+        scalar_input = xv.ndim == 0
+        x_eval = np.atleast_1d(xv)
+        flux = np.zeros_like(x_eval, dtype=float)
 
-        if np.any(np.diff(edges) <= 0):
-            raise ValueError("BinnedSED10 energy edges must be strictly increasing.")
-
-        flux = np.zeros_like(xv, dtype=float)
-
-        for i in range(10):
+        for i in range(self.n_bins):
             elo = edges[i]
             ehi = edges[i + 1]
             epiv = np.sqrt(elo * ehi)
 
-            # Half-open bins [E_i, E_{i+1}), except the last bin which
-            # includes its upper edge. The exact endpoint convention has
-            # zero effect on a continuous energy integral.
-            if i < 9:
-                mask = (xv >= elo) & (xv < ehi)
+            if i < self.n_bins - 1:
+                mask = (x_eval >= elo) & (x_eval < ehi)
             else:
-                mask = (xv >= elo) & (xv <= ehi)
+                mask = (x_eval >= elo) & (x_eval <= ehi)
 
-            # Evaluate only inside the bin. This avoids unnecessary powers
-            # outside the model support and keeps the piecewise definition clear.
             if np.any(mask):
                 flux[mask] = kvals[i] * np.power(
-                    xv[mask] / epiv,
+                    x_eval[mask] / epiv,
                     index_value,
                 )
 
-        if x_has_units:
-            return flux * self.y_unit
+        result = flux[0] if scalar_input else flux
 
-        return flux
+        if x_has_units:
+            return result * self.y_unit
+
+        return result
 
     def integral(self, a, b):
         """
         Exact integral between two numerical energy boundaries.
 
         This follows the astromodels ``Function1D.integral`` convention and
-        returns a plain numerical value.  Use ``Function1D.integrate`` when
-        passing astropy quantities and a unit-bearing result is desired.
+        returns a plain numerical value. Use ``Function1D.integrate`` for
+        Quantity boundaries and a unit-bearing result.
         """
 
         if isinstance(a, u.Quantity):
@@ -268,22 +267,16 @@ class BinnedSED10(Function1D, metaclass=FunctionMeta):
         if bv < av:
             return -self.integral(bv, av)
 
-        edges = np.array(
-            [getattr(self, f"E{i}").value for i in range(11)],
-            dtype=float,
-        )
-        kvals = np.array(
-            [getattr(self, f"K{i}").value for i in range(10)],
-            dtype=float,
-        )
+        edges = self.bin_edges
+        kvals = np.asarray([par.value for par in self.normalizations], dtype=float)
         idx = float(self.index.value)
 
-        if np.any(np.diff(edges) <= 0):
-            raise ValueError("BinnedSED10 energy edges must be strictly increasing.")
+        if np.any(np.diff(edges) <= 0.0):
+            raise ValueError("BinnedSED energy edges must be strictly increasing.")
 
         total = 0.0
 
-        for i in range(10):
+        for i in range(self.n_bins):
             lo = max(av, edges[i])
             hi = min(bv, edges[i + 1])
 
@@ -308,3 +301,104 @@ class BinnedSED10(Function1D, metaclass=FunctionMeta):
             total += integ
 
         return float(total)
+
+
+def _make_function_doc(n_bins):
+    lines = [
+        "description :",
+        f"    Piecewise power-law SED with {n_bins} response-defined true-energy bins.",
+        "parameters :",
+    ]
+
+    for i in range(n_bins):
+        lines.extend(
+            [
+                f"    K{i} :",
+                f"        desc : Differential normalization in true-energy bin {i}",
+                "        initial value : 1e-6",
+            ]
+        )
+        if i == 0:
+            lines.append("        is_normalization : True")
+        lines.extend(
+            [
+                "        min : 0",
+                "        max : 1e-2",
+                "        delta : 1e-7",
+            ]
+        )
+
+    for i in range(n_bins + 1):
+        if i == 0:
+            desc = "Lower edge of SED bin 0"
+        elif i == n_bins:
+            desc = f"Upper edge of SED bin {n_bins - 1}"
+        else:
+            desc = f"Edge between SED bins {i - 1} and {i}"
+
+        lines.extend(
+            [
+                f"    E{i} :",
+                f"        desc : {desc}",
+                f"        initial value : {i + 1}",
+                "        fix : yes",
+            ]
+        )
+
+    lines.extend(
+        [
+            "    index :",
+            "        desc : Local power-law index in every SED bin",
+            "        initial value : -2",
+            "        min : -10",
+            "        max : 10",
+            "        fix : yes",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def _make_evaluate(n_bins):
+    k_names = [f"K{i}" for i in range(n_bins)]
+    e_names = [f"E{i}" for i in range(n_bins + 1)]
+    parameters = k_names + e_names + ["index"]
+
+    source = (
+        f"def evaluate(self, x, {', '.join(parameters)}):\n"
+        f"    return self._evaluate_impl(x, [{', '.join(k_names)}], "
+        f"[{', '.join(e_names)}], index)\n"
+    )
+
+    namespace = {}
+    exec(source, {}, namespace)
+    return namespace["evaluate"]
+
+
+def _set_units(self, x_unit, y_unit):
+    self._set_units_impl(x_unit, y_unit)
+
+
+def _get_binned_sed_class(n_bins):
+    n_bins = int(n_bins)
+
+    if n_bins < 1:
+        raise ValueError("BinnedSED requires at least one bin.")
+
+    if n_bins not in _BINNED_SED_CLASSES:
+        class_name = f"BinnedSED_{n_bins}"
+        namespace = {
+            "__doc__": _make_function_doc(n_bins),
+            "__module__": __name__,
+            "_n_sed_bins": n_bins,
+            "evaluate": _make_evaluate(n_bins),
+            "_set_units": _set_units,
+        }
+
+        concrete_class = FunctionMeta(class_name, (BinnedSED,), namespace)
+        _BINNED_SED_CLASSES[n_bins] = concrete_class
+
+        # Make the generated class discoverable in this module after creation.
+        globals()[class_name] = concrete_class
+
+    return _BINNED_SED_CLASSES[n_bins]
