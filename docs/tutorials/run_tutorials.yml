@@ -179,6 +179,22 @@ tutorials:
         COSI-SMEX/cosipy_tutorials/Data/Responses/PointSourceResponse/psr_gal_511_DC2.h5:
           checksum: 50eb36c2bc0089ba230af457ec768fa0
 
+    spectral_fit_sed_model:
+      notebook: spectral_fits/sed_model/sed_spectral_model_tutorial.ipynb
+      ancillary_files:
+       - spectral_fits/sed_model/galdiff.yaml
+       - spectral_fits/sed_model/Positrons_In_Flight_Annihilation_spec.dat
+      wasbi_files:
+       COSI-SMEX/DC4/Data/Orientation/DC4_final_530km_3_month_with_slew_15sbins_GalacticEarth_SAA.fits:
+         checksum: ca94ff1d7a73c1f41479aaf598807673
+       COSI-SMEX/DC3/Data/Responses/extended_source_response/extended_source_response_continuum_merged.h5.gz:
+         unzip: True
+         checksum: 92ed7e22b1dafce6b57611d5cdb6cf70
+       COSI-SMEX/DC4/Data/Backgrounds/Total_DC4_BG_3months_unbinned_data_filtered_with_SAAcut_withSAAbck.fits.gz:
+         checksum: 73c8b23e43684da3b35c25499254202b
+       COSI-SMEX/DC4/Data/Sources/positron_annihilation_in_flight_3months_unbinned_data_filtered_with_SAAcut.fits.gz:
+         checksum: 5d9d2ca1433e571dfb2f06cb8236fd59
+
     imaging_511:
       notebook:
         - image_deconvolution/511keV-Galactic-ImageDeconvolution.ipynb
