@@ -190,10 +190,10 @@ tutorials:
        COSI-SMEX/DC3/Data/Responses/extended_source_response/extended_source_response_continuum_merged.h5.gz:
          unzip: True
          checksum: 92ed7e22b1dafce6b57611d5cdb6cf70
-       COSI-SMEX/DC4/Data/Backgrounds/Total_DC4_BG_3months_unbinned_data_filtered_with_SAAcut_withSAAbck.fits.gz:
-         checksum: 73c8b23e43684da3b35c25499254202b
-       COSI-SMEX/DC4/Data/Sources/positron_annihilation_in_flight_3months_unbinned_data_filtered_with_SAAcut.fits.gz:
-         checksum: 5d9d2ca1433e571dfb2f06cb8236fd59
+       COSI-SMEX/cosipy_tutorials/sed_model_spectral_fit/total_BG_binned_data.hdf5:
+         checksum: 4cc422ce4e03e591be6fc8c8c7636c1e
+       COSI-SMEX/cosipy_tutorials/sed_model_spectral_fit/inflight_binned_data.hdf5:
+         checksum: 6e0c84e9d97f2ba5ba8c3667209a20dd
 
     imaging_511:
       notebook:
