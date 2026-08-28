@@ -72,6 +72,7 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         sc_history,
         energy_edges,
         exposure_map=None,
+        response_matrix=None,
         background_models=None,
         name="UnbinnedImageDataInterface",
     ):
@@ -98,6 +99,15 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
             Pre-computed per-pixel exposure of shape ``(npix,)`` in cm^2 s sr
             (effective area x livetime x pixel solid angle).  Computed from
             ``sc_history`` when omitted.
+        response_matrix : array-like, optional
+            Pre-computed sky response of shape ``(npix, n_events)``.  Building
+            it costs one IRF evaluation per pixel over the whole event list, so
+            supplying a cached array turns a multi-minute step into a file
+            read.  Only its shape is checked: a matrix is valid solely for the
+            exact ``nside``, event list, ``energy_edges``, ``sc_history``
+            window and IRF it was built from, and a mismatched one produces
+            wrong fluxes rather than an error.  Key any cache on all of those.
+            Computed from ``irf`` when omitted.
         background_models : dict, optional
             Maps a background model name to its per-event contribution.  Each
             value is either an object implementing
@@ -185,7 +195,17 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         for key, model in (background_models or {}).items():
             self.set_background_model(key, model)
 
-        self._response_matrix = None  # built on first use
+        # --- Response matrix ---
+        if response_matrix is None:
+            self._response_matrix = None  # built on first use
+        else:
+            matrix = np.asarray(response_matrix, dtype=float)
+            if matrix.shape != (self._npix, self._n_events):
+                raise ValueError(
+                    f"response_matrix must have shape ({self._npix}, "
+                    f"{self._n_events}), got {matrix.shape}"
+                )
+            self._response_matrix = matrix
 
     # ------------------------------------------------------------------
     # Data-space helpers
@@ -331,7 +351,7 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
         n_intervals = len(livetime)
 
         # Each interval is represented by the attitude at its start.
-        rot_intervals = sc.attitude.rot.inv().as_matrix()[:-1]
+        rot = sc.attitude.rot.inv()
 
         if n_intervals > n_time_samples:
             # Split the history into contiguous chunks and weight each sampled
@@ -341,7 +361,12 @@ class UnbinnedImageDataInterface(ImageDeconvolutionDataInterfaceBase):
             edges = np.linspace(0, n_intervals, n_time_samples + 1, dtype=int)
             cumulative = np.concatenate(([0.0], np.cumsum(livetime)))
             livetime = cumulative[edges[1:]] - cumulative[edges[:-1]]
-            rot_intervals = rot_intervals[(edges[:-1] + edges[1:]) // 2]
+            # Index the rotation before expanding it: three months of 1 s bins is
+            # ~8e6 intervals, and as_matrix() over all of them costs ~0.5 GB only
+            # to discard all but n_time_samples of the rows.
+            rot_intervals = rot[(edges[:-1] + edges[1:]) // 2].as_matrix()
+        else:
+            rot_intervals = rot.as_matrix()[:-1]
 
         n_t = len(livetime)
 
