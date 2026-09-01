@@ -1,0 +1,61 @@
+# ImageDeconvolution parameter file for run_deconvolution.py.
+#
+# `model_definition:property:nside` and `:energy_edges` below are OVERRIDDEN
+# by the script from the interface's own model axes, so they cannot drift
+# out of step with config.yaml.  They are kept here so the file is valid on
+# its own.
+#
+# `deconvolution:parameter:iteration_max` is overridden only when
+# `deconvolution:iterations` is set in config.yaml, and
+# `background_normalization_optimization:activate` only when the background
+# is enabled there.
+
+model_definition:
+  class: "AllSkyImage"
+  property:
+    nside: 4
+    energy_edges:
+      value: [505.0, 517.0]
+      unit: "keV"
+    scheme: "ring"
+    coordinate: "galactic"
+    unit: "cm-2 s-1 sr-1"
+  initialization:
+    algorithm: "flat"
+    parameter:
+      value: [1.0e-4]
+      unit: "cm-2 s-1 sr-1"
+
+deconvolution:
+  algorithm: "RLadvanced"
+  parameter:
+    iteration_max: 50
+
+    # Floor on the reconstructed flux.  Zero keeps the map non-negative
+    # without pinning empty pixels above zero.
+    minimum_flux:
+      value: 0.0
+      unit: "cm-2 s-1 sr-1"
+
+    # MaxStepAccelerator.  It rejects any accelerated step whose
+    # log-likelihood is below the unaccelerated one, which is exactly the
+    # check that the unbinned likelihood's normalization bin makes possible.
+    acceleration:
+      activate: True
+      accel_factor_max: 1.25
+
+    # Down-weights the delta map by the response, so poorly exposed pixels
+    # do not run away.
+    response_weighting:
+      activate: True
+      index: 0.5
+
+    stopping_criteria:
+      statistics: "log-likelihood"
+      threshold: 1.0e-2
+
+    # Off by default: the DC2 511 keV file is a pure source simulation, so
+    # there is no background component to normalize.  The script turns this
+    # on when `background:fit_normalization` is set in config.yaml.
+    background_normalization_optimization:
+      activate: False
