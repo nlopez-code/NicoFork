@@ -14,6 +14,18 @@ normalizing-flow model, ``"hist"`` for a histogrammed background
 simulation, or ``None`` for no background at all.  See the setting itself
 for what each one costs.
 
+``INJECT_BACKGROUND`` sprinkles a reproducible random sample of *real*
+background events from the DC4 background simulation into the event list,
+so the background model has something to actually account for.  That is
+the point of the exercise: inject a known number of background events and
+see whether the fitted normalization recovers it.
+
+Output goes to ``results/<key>/``, where the key is the one the response
+matrix is cached under -- nside, energy band, event count, and the injected
+background count and seed.  Two runs share a directory only when they share
+a response matrix, so a run cannot leave files behind inside another's
+results.
+
 Writes iterations.json, model_iteration*.h5, exposure_map.h5, summary.json,
 convergence.png, reconstructed_image.png, one mollview per iteration under
 iterations/, and iterations_grid.png, plus a copy of this script and the
@@ -23,6 +35,7 @@ parameter file.  Exits non-zero if the log-likelihood ever decreased.
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -126,15 +139,92 @@ BKG_ENERGY_BINS  = 4
 BKG_PHI_BINS     = 36
 BKG_NSIDE        = 4         # PsiChi axis, in galactic coordinates
 
+# --- Injected background events ----------------------------------------
+# Sprinkle real background events from the DC4 background simulation into
+# the source event list, so the background model has something to actually
+# account for.  This is independent of BACKGROUND: the test is to inject a
+# known number of background events and see whether the fitted background
+# normalization recovers it.
+#
+# Every injected event costs a response-matrix column -- npix * 8 bytes,
+# 96 kB at NSIDE=32 -- so this is the setting that decides whether the run
+# still fits in RAM.  On top of the ~240k source events that already make a
+# 22 GB matrix at this nside:
+#
+#    50,000 injected  ->  26.6 GB
+#    75,000 injected  ->  28.9 GB
+#   100,000 injected  ->  31.2 GB    over 32 GB of RAM once the IRF, the
+#                                    event list and the flow are counted
+#
+# MAX_RESPONSE_GB below is the guard rail, and it is checked as soon as the
+# event list is final -- before the IRF load, not after.
+#
+# The draw is reproducible: the same INJECT_N_EVENTS and INJECT_SEED select
+# the same events out of the same file, every time.
+INJECT_BACKGROUND = True
+INJECT_N_EVENTS   = 75_000
+INJECT_SEED       = 12345
+
+# The DECOMPRESSED background file.  astropy cannot memmap a .gz, so given
+# the .gz it decompresses all 168,648,544 rows x 112 bytes (18.9 GB) into
+# memory before any cut is applied -- which does not fit alongside the
+# response matrix.  Uncompressed, read_background_pool memmaps it and holds
+# only INJECT_CHUNK_ROWS rows at a time.  Make it once with:
+#
+#   gunzip -k ~/software/testData/background/Total_DC4_BG_3months_unbinned_data_filtered_with_SAAcut_withSAAbck.fits.gz
+#
+# -k keeps the .gz; the plain file needs 18.9 GB of disk.
+INJECT_PATHS = [
+    data_dir + "/background/Total_DC4_BG_3months_unbinned_data_filtered_with_SAAcut_withSAAbck.fits",
+            ]
+
+# Rows materialized per read.  Peak allocation is the five columns used,
+# ~40 MB at a million rows, regardless of how big the file is.  (Resident
+# memory looks larger while scanning because the memmapped pages count
+# toward RSS; they are clean and the OS drops them under pressure.)
+INJECT_CHUNK_ROWS = 1_000_000
+
 CACHE     = True             # reuse the response matrix across runs
+
+def run_key(nevents, n_background):
+    """The identity of a run: what its response matrix is valid for.
+
+    Everything in here changes the matrix, so a change to any of it has to
+    produce a different name -- including the injection seed, since the same
+    count with a different seed is a different set of events and therefore a
+    different matrix.  Used for both the cache file and the results
+    directory, so a result and the matrix that produced it carry the same
+    name.
+    """
+
+    key = (f"ns{NSIDE}_e{int(E_MIN_KEV)}-{int(E_MAX_KEV)}_n{nevents}")
+    if n_background:
+        key += f"_bkg{n_background}"
+        if INJECT_BACKGROUND:
+            key += f"s{INJECT_SEED}"
+    return key
+
+
+# Refuse to build a response matrix bigger than this, rather than finding
+# out by being OOM-killed an hour in.  It is npix * nevents * 8 bytes, and
+# the deconvolution needs room for the IRF and the event list on top, so
+# leave headroom below the machine's RAM.  None disables the check.
+MAX_RESPONSE_GB = 29.0
 
 # Cached response matrices go in the shared cache directory rather than
 # OUT_DIR, so a results directory holds only the run's own output and stays
 # comparable to one written by run_deconvolution.py.  They are ~1.5 GB each.
 CACHE_DIR = os.path.expanduser("~/software/jar of pickles")
 
-OUT_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "results", "simple")
+# Each run writes to <RESULTS_ROOT>/<key>, where the key is the same one
+# the response matrix is cached under (see run_key).  Keying the directory
+# means a run cannot land on top of a different one's output: two runs share
+# a directory only when they share a response matrix, and then they really
+# are the same run.  A fixed directory does not have that property -- a
+# 50-iteration run dropped into one holding 125 files leaves the last 75
+# behind, and nothing downstream can tell they are from something else.
+RESULTS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "results")
 
 SAVE_ALL_ITERATIONS = True   # False = only the last model_iteration*.h5
 SAVE_PLOTS = True
@@ -259,6 +349,172 @@ def concatenate(source_events, background_events):
 
 
 # ===========================================================================
+# Background injection
+# ===========================================================================
+# The columns TimeTagEmCDSEventDataInSCFrameFromDC3Fits actually uses, under
+# the names it gives them.  Everything else in the DC4 table -- the
+# pointings, the distance, the galactic Chi/Psi -- is dead weight here.
+_INJECT_COLUMNS = {
+    "time_unix":  "TimeTags",
+    "energy_keV": "Energies",
+    "phi_rad":    "Phi",
+    "chi_rad":    "Chi local",
+    "psi_rad":    "Psi local",
+}
+
+
+def read_background_pool(paths, emin_keV, emax_keV, chunk_rows=INJECT_CHUNK_ROWS):
+    """Every background event in [emin, emax] keV, read a chunk at a time.
+
+    This exists instead of ``TimeTagEmCDSEventDataInSCFrameFromDC3Fits``
+    because that reader (and astropy under it) materializes the whole table
+    before the selection runs.  The total DC4 background is 168.6M rows of
+    112 bytes, so that is 18.9 GB of event table before a single event has
+    been cut -- and this run has to fit a 22 GB response matrix into the
+    same 32 GB.
+
+    Memmapping the *uncompressed* file and slicing rows keeps only
+    ``chunk_rows`` rows resident.  The pages still stream past, so this
+    reads the whole file from disk, but the resident cost is the chunk plus
+    the surviving events.
+
+    Returns a dict of native-endian float64 arrays keyed by
+    ``_INJECT_COLUMNS``, holding the events inside the energy band.
+    """
+
+    from astropy.io import fits
+
+    columns = {name: [] for name in _INJECT_COLUMNS}
+    n_scanned = 0
+    t0 = time.time()
+
+    for path in paths:
+        with fits.open(path, memmap=True, lazy_load_hdus=True) as hdul:
+            hdu = next((h for h in hdul if isinstance(h, fits.BinTableHDU)), None)
+            if hdu is None:
+                raise RuntimeError(f"{path}: no binary table extension")
+
+            available = set(hdu.columns.names)
+            missing = [c for c in _INJECT_COLUMNS.values() if c not in available]
+            if missing:
+                raise RuntimeError(f"{path}: missing column(s) {missing}")
+
+            nrows = int(hdu.header["NAXIS2"])
+            log.info("Scanning %s (%s rows) for events in [%g, %g] keV ...",
+                     os.path.basename(path), f"{nrows:,}", emin_keV, emax_keV)
+
+            # hdu.data on a memmapped file is a lazy record array; slicing it
+            # is a view, and only the columns touched below are ever read.
+            table = hdu.data
+
+            for start in range(0, nrows, chunk_rows):
+                rows = table[start:start + chunk_rows]
+
+                # astype: FITS columns are big-endian, and torch refuses
+                # anything but native order later on (see the sc_history
+                # livetime note in the run section).
+                energy = np.asarray(rows[_INJECT_COLUMNS["energy_keV"]]).astype(np.float64)
+                keep = (energy >= emin_keV) & (energy <= emax_keV)
+
+                if keep.any():
+                    columns["energy_keV"].append(energy[keep])
+                    for name, column in _INJECT_COLUMNS.items():
+                        if name == "energy_keV":
+                            continue
+                        columns[name].append(
+                            np.asarray(rows[column]).astype(np.float64)[keep])
+
+                n_scanned += len(rows)
+                if start and (start // chunk_rows) % 20 == 0:
+                    rate = n_scanned / max(time.time() - t0, 1e-9)
+                    log.info("... %5.1f%% (%s rows, %.1f M rows/s, ~%.0f s left)",
+                             100.0 * n_scanned / nrows, f"{n_scanned:,}",
+                             rate / 1e6, (nrows - n_scanned) / rate)
+
+    pool = {name: (np.concatenate(parts) if parts else np.empty(0))
+            for name, parts in columns.items()}
+
+    n_in_band = pool["energy_keV"].size
+    log.info("... %s of %s events in band (%.4g%%, %.1f s, %.0f MB held)",
+             f"{n_in_band:,}", f"{n_scanned:,}",
+             100.0 * n_in_band / max(n_scanned, 1), time.time() - t0,
+             n_in_band * 8 * len(_INJECT_COLUMNS) / 1024**2)
+
+    if n_in_band == 0:
+        raise RuntimeError(
+            f"No background event survived the [{emin_keV}, {emax_keV}] keV "
+            "cut -- check INJECT_PATHS and the energy band.")
+
+    return pool
+
+
+def inject_background_events(pool, n_inject, seed, sc_history):
+    """Draw ``n_inject`` background events at random from ``pool``.
+
+    Returns the event list and the size of the pool it was drawn from: the
+    number of *real* background events in the band and inside the
+    spacecraft-history window.  That count is what the injected number has
+    to be compared against, because their ratio is the fraction of the true
+    background the analysis actually contains -- which is what the
+    background model's prediction has to be scaled by.
+
+    The window cut is not cosmetic.  ``FreeNormNFUnbinnedBackground``
+    raises on any event outside ``[tstart, tstop]``, and an event landing
+    exactly on ``tstop`` indexes one past the last livetime interval.
+    """
+
+    from cosipy.data_io.EmCDSUnbinnedData import TimeTagEmCDSEventDataInSCFrameFromArrays
+
+    tstart = float(sc_history.tstart.utc.unix)
+    tstop = float(sc_history.tstop.utc.unix)
+
+    inside = (pool["time_unix"] >= tstart) & (pool["time_unix"] < tstop)
+    n_available = int(inside.sum())
+
+    if n_available < pool["time_unix"].size:
+        log.info("Dropping %s background event(s) outside the spacecraft "
+                 "history window", f"{pool['time_unix'].size - n_available:,}")
+
+    if n_available == 0:
+        raise RuntimeError(
+            "No in-band background event falls inside the spacecraft history "
+            "window -- INJECT_PATHS and SC_PATH cover different epochs.")
+
+    if n_inject > n_available:
+        log.warning("Only %s in-band background events available; injecting "
+                    "all of them instead of %s",
+                    f"{n_available:,}", f"{n_inject:,}")
+        n_inject = n_available
+
+    # choice(replace=False) over the in-window subset, so the draw depends
+    # only on the seed and the count -- not on where the window cut landed.
+    rng = np.random.default_rng(seed)
+    picked = np.flatnonzero(inside)[
+        np.sort(rng.choice(n_available, size=n_inject, replace=False))]
+
+    times = Time(pool["time_unix"][picked], format="unix")
+
+    # Same column mapping as TimeTagEmCDSEventDataInSCFrameFromDC3Fits:
+    # Chi local is the scattered longitude, Psi local its colatitude, and
+    # Phi the Compton scattering angle.
+    events = TimeTagEmCDSEventDataInSCFrameFromArrays(
+        jd1=times.jd1,
+        jd2=times.jd2,
+        energy_keV=pool["energy_keV"][picked],
+        scattered_lon_rad_sc=pool["chi_rad"][picked],
+        scattered_lat_rad_sc=np.pi / 2 - pool["psi_rad"][picked],
+        scatt_angle_rad=pool["phi_rad"][picked],
+    )
+
+    log.info("Injecting %s of %s in-band background events (seed %d) -- "
+             "%.4g%% of the true background",
+             f"{events.nevents:,}", f"{n_available:,}", seed,
+             100.0 * events.nevents / n_available)
+
+    return events, n_available
+
+
+# ===========================================================================
 # Background
 # ===========================================================================
 
@@ -369,21 +625,32 @@ def build_background_model(simulation_events, events, n_background, sc_history):
     return model
 
 
-def build_nf_background_model(events, sc_history, sampling_fraction):
+def build_nf_background_model(events, sc_history, thinning):
     """The trained normalizing-flow background, as a (density, total) pair.
 
     ``NFBackground`` carries its own absolute rate, so unlike the histogram
-    path there is no simulation to read and nothing is added to the event
-    list -- the flow is evaluated at the source events themselves.
+    path there is no simulation to read: the flow is evaluated at whatever
+    events it is handed.
 
-    The pair rather than the model object is deliberate.
-    ``FreeNormNFUnbinnedBackground.expected_counts()`` integrates the flow's
-    rate over the whole ``sc_history``, so it is the background for *every*
-    event in the window; we kept only ``sampling_fraction`` of them, and
-    that total has to carry the same factor.  ``expectation_density()`` is
-    already per kept event and must not be scaled.  Registering the model
-    object instead would hand the interface the unscaled total and bias both
-    the fluxes and the fitted norm by 1 / sampling_fraction.
+    ``thinning`` is the fraction of the true background the event list
+    actually contains -- ``INJECT_N_EVENTS`` out of every in-band background
+    event when injecting, or ``sampling_fraction`` when the list was thinned
+    by ``N_EVENTS``.  Thinning a Poisson process by p gives a Poisson
+    process of intensity p * lambda, so BOTH halves of the pair carry the
+    factor: the total because it is the integral of that intensity, and the
+    per-event density because it *is* that intensity evaluated at an event.
+    Scaling only one of them leaves the pair mutually inconsistent, and no
+    single fitted normalization can reconcile them -- the norm multiplies
+    both together.
+
+    The pair rather than the model object is deliberate:
+    ``FreeNormNFUnbinnedBackground`` has no way to be told about the
+    thinning, so registering it directly would hand the interface an
+    unscaled total and bias both the fluxes and the fitted norm by 1 / p.
+
+    The flow's total is also over its whole training domain, so it carries
+    ``band_fraction`` on top -- see NF_BAND_FRACTION.  The density needs no
+    such factor: it is already evaluated at in-band events.
     """
 
     from cosipy.background_estimation.ml import (
@@ -414,19 +681,20 @@ def build_nf_background_model(events, sc_history, sampling_fraction):
     )
 
     log.info("Evaluating the flow at %d events ...", events.nevents)
-    density = np.asarray(bkg.expectation_density(), dtype=float)
+    density = np.asarray(bkg.expectation_density(), dtype=float) * thinning
     full_total = float(bkg.expected_counts())
 
     band_fraction = NF_BAND_FRACTION
     if band_fraction is None:
         band_fraction = nf_band_fraction(model, sc_history)
 
-    total = full_total * sampling_fraction * band_fraction
+    band_total = full_total * band_fraction
+    total = band_total * thinning
 
     log.info("... %.4g counts over the flow's whole %s domain; x%.5g in "
-             "band x%.5g sampled -> N_tot = %.1f",
-             full_total, "[100, 20000] keV", band_fraction,
-             sampling_fraction, total)
+             "band -> %.1f, x%.5g present -> N_tot = %.1f",
+             full_total, "[100, 20000] keV", band_fraction, band_total,
+             thinning, total)
     log.info("... per-event density min=%.4g max=%.4g (%.1f s total)",
              density.min(), density.max(), time.time() - t0)
 
@@ -529,6 +797,41 @@ def sky_norm(values, lo, hi):
     return LogNorm(vmin=floor, vmax=float(hi))
 
 
+def clear_stale_iterations(out_dir, model_keep, frame_keep):
+    """Delete per-iteration files this run is not going to write.
+
+    A directory is one run's output, and a run that stops earlier than the
+    one before it would otherwise leave that run's tail sitting there --
+    ``model_iteration051.h5`` onwards from a 125-iteration run, in a
+    directory whose summary.json says 50.  Nothing downstream can tell the
+    difference, so an analysis reads the two as one sequence.
+
+    Only the numbered per-iteration files are touched.  Everything else in
+    the directory is either overwritten by this run (summary.json, the
+    plots, the script copies) or was put there by hand.
+    """
+
+    stale = []
+
+    for path in out_dir.glob("model_iteration*.h5"):
+        match = re.fullmatch(r"model_iteration(\d+)\.h5", path.name)
+        if match and int(match.group(1)) not in model_keep:
+            stale.append(path)
+
+    for path in (out_dir / "iterations").glob("iteration*.png"):
+        match = re.fullmatch(r"iteration(\d+)\.png", path.name)
+        if match and int(match.group(1)) not in frame_keep:
+            stale.append(path)
+
+    if not stale:
+        return
+
+    log.info("Removing %d stale per-iteration file(s) from an earlier run in "
+             "%s (e.g. %s)", len(stale), out_dir, sorted(p.name for p in stale)[0])
+    for path in stale:
+        path.unlink()
+
+
 def save_results(image_deconvolution, interface, out_dir, summary):
     """Write the reconstructed maps, the per-iteration table and diagnostics."""
 
@@ -559,6 +862,15 @@ def save_results(image_deconvolution, interface, out_dir, summary):
 
     # --- Model maps ---
     to_save = results if SAVE_ALL_ITERATIONS else results[-1:]
+
+    # Before writing, not after: what is written now is what the directory
+    # should hold, and clearing first means a crash between the two leaves a
+    # short directory rather than a mixed one.
+    clear_stale_iterations(
+        out_dir,
+        model_keep={r["iteration"] for r in to_save},
+        frame_keep=({r["iteration"] for r in results}
+                    if SAVE_PLOTS and SAVE_ITERATION_PLOTS else set()))
 
     for r in to_save:
         r["model"].write(str(out_dir / f"model_iteration{r['iteration']:03d}.h5"),
@@ -733,7 +1045,10 @@ if __name__ == "__main__":
         DataInterfaceCollection,
     )
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # Only the parent here: the run's own directory is named after the event
+    # list, which does not exist yet.  This still fails early if the path is
+    # not writable at all.
+    os.makedirs(RESULTS_ROOT, exist_ok=True)
     t_run = time.time()
 
     # Fail here rather than a minute into the run, with the path that is
@@ -747,13 +1062,39 @@ if __name__ == "__main__":
         required = required + [NF_BKG_PATH]
     elif BACKGROUND == "hist":
         required = required + BKG_PATHS
+    if INJECT_BACKGROUND:
+        required = required + INJECT_PATHS
     missing = [p for p in required if not os.path.exists(p)]
     if missing:
-        raise SystemExit("Missing input(s):\n  " + "\n  ".join(missing))
+        # A missing injection file is nearly always the .gz not having been
+        # decompressed yet, so say so with the command rather than the path.
+        hint = ""
+        for path in missing:
+            if path in INJECT_PATHS and os.path.exists(path + ".gz"):
+                hint = (f"\n\nDecompress the background simulation first "
+                        f"(needs 18.9 GB of disk):\n  gunzip -k {path}.gz")
+        raise SystemExit("Missing input(s):\n  " + "\n  ".join(missing) + hint)
+
+    # A .gz here would be read by astropy with no memmap: all 18.9 GB of the
+    # table in RAM before the energy cut, which is exactly what the chunked
+    # reader avoids.  Fail on it rather than let the machine swap to death.
+    if INJECT_BACKGROUND:
+        compressed = [p for p in INJECT_PATHS if p.endswith(".gz")]
+        if compressed:
+            raise SystemExit(
+                "INJECT_PATHS must point at the DECOMPRESSED FITS file -- "
+                "astropy cannot memmap a .gz and would read the whole "
+                f"18.9 GB table into memory:\n  " + "\n  ".join(compressed) +
+                "\n\nDecompress it once with:\n  gunzip -k " + compressed[0])
 
     # Likewise: say that histpy is too old now, not after the 7 GB response.
     if BACKGROUND == "hist":
         check_background_prerequisites()
+
+    if INJECT_BACKGROUND and BACKGROUND is None:
+        log.warning("Injecting background events with BACKGROUND = None: "
+                    "nothing will model them, and the reconstruction will "
+                    "absorb them into the sky.")
 
     # --- Events -----------------------------------------------------------
     # FromDC3Fits takes a list and time-sorts across files, so it already
@@ -764,18 +1105,57 @@ if __name__ == "__main__":
     log.info("... %d source events in [%g, %g] keV",
              source_events.nevents, E_MIN_KEV, E_MAX_KEV)
 
-    # The background simulation gets the same energy cut, then rides along
-    # in the same list -- the likelihood does not distinguish the two, only
-    # the background model's density does.
+    # --- Spacecraft history ----------------------------------------------
+    # Whole file, no time cut -- develop's behaviour.  The exposure map is
+    # integrated over all of it, so this is only right when the events span
+    # the same period; the two spans are logged so a mismatch is visible.
     #
-    # The reader loads the entire table and only then applies the selection
-    # (FromDC3Fits appends every column, time-sorts, and passes `selection`
-    # to the parent), so the peak memory here is set by the file's total
-    # event count, not by how many survive the cut.  The total DC4
-    # background is 168.6M events x 11 columns, and astropy cannot memmap a
-    # .gz, so budget tens of GB.
+    # Read before the background events, not after: injected events have to
+    # be restricted to this window before they join the list, and the
+    # fraction of the true background they represent is counted against the
+    # events inside it.
+    log.info("Reading the spacecraft history...")
+    sc_history = SpacecraftHistory.open(SC_PATH)
+
+    # astropy hands back FITS columns in the file's big-endian order, and
+    # torch.as_tensor refuses anything but native order ("given numpy array
+    # has byte order different from the native byte order").  That kills
+    # FreeNormNFUnbinnedBackground._integrate_rate, which wraps
+    # sc_history.livetime directly.  Normalize it once here.
+    if np.asarray(sc_history.livetime).dtype.byteorder not in ("=", "|"):
+        sc_history._livetime = u.Quantity(
+            np.asarray(sc_history.livetime.to_value(u.s), dtype=np.float64), u.s)
+
+    log.info("sc_hist %s to %s, livetime %.1f s",
+             sc_history.tstart.utc.isot, sc_history.tstop.utc.isot,
+             sc_history.livetime.sum().to_value(u.s))
+
+    # --- Background events ------------------------------------------------
+    # Background events ride along in the same list as the source events --
+    # the likelihood does not distinguish the two, only the background
+    # model's density does.
     bkg_events = None
-    if BACKGROUND == "hist":
+    n_background_pool = 0
+
+    if INJECT_BACKGROUND:
+        pool = read_background_pool(INJECT_PATHS, E_MIN_KEV, E_MAX_KEV)
+        bkg_events, n_background_pool = inject_background_events(
+            pool, INJECT_N_EVENTS, INJECT_SEED, sc_history)
+        del pool
+
+        if BACKGROUND == "hist":
+            log.warning("BACKGROUND = 'hist' with injection: the (Em, Phi, "
+                        "PsiChi) shape is built from the %d injected events "
+                        "alone, not the full simulation.", bkg_events.nevents)
+
+    elif BACKGROUND == "hist":
+        # This reader loads the entire table and only then applies the
+        # selection (FromDC3Fits appends every column, time-sorts, and
+        # passes `selection` to the parent), so peak memory here is set by
+        # the file's total event count, not by how many survive the cut.
+        # The total DC4 background is 168.6M events x 11 columns, and
+        # astropy cannot memmap a .gz, so budget tens of GB.  Use
+        # INJECT_BACKGROUND instead to stay within a sane memory budget.
         log.info("Reading %d background FITS file(s) ...", len(BKG_PATHS))
         bkg_events = TimeTagEmCDSEventDataInSCFrameFromDC3Fits(
             BKG_PATHS, selection=EnergySelector(E_MIN_KEV, E_MAX_KEV))
@@ -790,8 +1170,8 @@ if __name__ == "__main__":
 
     # Thinning a Poisson process with probability p gives a Poisson process
     # of intensity p * lambda, so every TOTAL downstream -- the exposure map
-    # and the background's expected counts -- carries this factor.  Per-event
-    # densities do not.  Forget it and every fitted flux is low by exactly p.
+    # and the background's expected counts -- carries this factor.  Forget it
+    # and every fitted flux is low by exactly p.
     n_in_band = events.nevents
     events, is_background = subsample(events, is_background, N_EVENTS)
     n_background = int(is_background.sum())
@@ -799,29 +1179,57 @@ if __name__ == "__main__":
 
     if sampling_fraction < 1.0:
         log.info("Sampling fraction %.5g -- the exposure map and the "
-                 "background total are scaled by it", sampling_fraction)
+                 "background component are scaled by it", sampling_fraction)
 
-    # --- Spacecraft history ----------------------------------------------
-    # Whole file, no time cut -- develop's behaviour.  The exposure map is
-    # integrated over all of it, so this is only right when the events span
-    # the same period; the two spans are logged so a mismatch is visible.
-    log.info("Reading the spacecraft history...")
-    sc_history = SpacecraftHistory.open(SC_PATH)
-
-    # astropy hands back FITS columns in the file's big-endian order, and
-    # torch.as_tensor refuses anything but native order ("given numpy array
-    # has byte order different from the native byte order").  That kills
-    # FreeNormNFUnbinnedBackground._integrate_rate, which wraps
-    # sc_history.livetime directly.  Normalize it once here.
-    if np.asarray(sc_history.livetime).dtype.byteorder not in ("=", "|"):
-        sc_history._livetime = u.Quantity(
-            np.asarray(sc_history.livetime.to_value(u.s), dtype=np.float64), u.s)
+    # The background component is thinned by its own factor, not the source
+    # one: what fraction of the REAL background is in the list.  Injection
+    # sets it explicitly (and N_EVENTS thins it further, which is why the
+    # count is taken after the subsample); without injection the whole
+    # background is nominally present and only N_EVENTS thins it.
+    if INJECT_BACKGROUND:
+        background_thinning = n_background / n_background_pool
+        log.info("Background thinning %.5g (%s of %s in-band background "
+                 "events) -- a correctly calibrated background model should "
+                 "fit a normalization of 1.0",
+                 background_thinning, f"{n_background:,}",
+                 f"{n_background_pool:,}")
+    else:
+        background_thinning = sampling_fraction
 
     ev_times = Time(np.asarray(events.jd1), np.asarray(events.jd2), format="jd")
-    log.info("events  %s to %s", ev_times.min().utc.isot, ev_times.max().utc.isot)
-    log.info("sc_hist %s to %s, livetime %.1f s",
-             sc_history.tstart.utc.isot, sc_history.tstop.utc.isot,
-             sc_history.livetime.sum().to_value(u.s))
+    log.info("events  %s to %s (%s events, %s from the background)",
+             ev_times.min().utc.isot, ev_times.max().utc.isot,
+             f"{events.nevents:,}", f"{n_background:,}")
+
+    # --- Memory budget ----------------------------------------------------
+    # Checked here, as soon as the event list is final, rather than at the
+    # interface: everything between is expensive (a 7 GB IRF load, and the
+    # flow evaluated at every event), and being told the list is too long
+    # only after paying for that is no help at all.
+    npix = 12 * NSIDE**2
+    response_gb = npix * events.nevents * 8 / 1024**3
+    log.info("Response matrix will be nside=%d (%d pixels) x %s events "
+             "-> %.2f GB", NSIDE, npix, f"{events.nevents:,}", response_gb)
+
+    if MAX_RESPONSE_GB is not None and response_gb > MAX_RESPONSE_GB:
+        affordable = int(MAX_RESPONSE_GB * 1024**3 / (npix * 8))
+        raise SystemExit(
+            f"The response matrix would be {response_gb:.2f} GB, over the "
+            f"{MAX_RESPONSE_GB:.2f} GB MAX_RESPONSE_GB budget.  At nside="
+            f"{NSIDE} that budget buys {affordable:,} events and the list "
+            f"holds {events.nevents:,}"
+            + (f" -- {n_background:,} of them injected background, so drop "
+               f"INJECT_N_EVENTS to {max(n_background - (events.nevents - affordable), 0):,} "
+               f"or less" if n_background else "")
+            + ".  Raise MAX_RESPONSE_GB to override.")
+
+    # --- Identity of this run ---------------------------------------------
+    # The event list is final, so the key is now known: it names both the
+    # cached response matrix and the results directory, which is what ties a
+    # result to the matrix that produced it.
+    key = run_key(events.nevents, n_background)
+    out_dir = os.path.join(RESULTS_ROOT, key)
+    log.info("Run key %s -> %s", key, out_dir)
 
     # --- Response ---------------------------------------------------------
     # copy=False: the contents are ~7 GB and __init__ divides them by the
@@ -835,18 +1243,31 @@ if __name__ == "__main__":
     # After the subsample, so the per-event densities line up with the event
     # list the interface is given.
     background_models = {}
+    expected_background_norm = None
+
     if BACKGROUND == "nf":
         background_models[BKG_LABEL] = build_nf_background_model(
-            events, sc_history, sampling_fraction)
+            events, sc_history, background_thinning)
     elif bkg_events is not None:
         background_models[BKG_LABEL] = build_background_model(
             bkg_events, events, n_background, sc_history)
 
-    # --- Interface --------------------------------------------------------
-    npix = 12 * NSIDE**2
-    log.info("Interface: nside=%d (%d pixels) x %d events -> %.2f GB response matrix",
-             NSIDE, npix, events.nevents, npix * events.nevents * 8 / 1024**3)
+    # With injection the answer is known: the list holds exactly
+    # n_background background events, and the model was handed its
+    # prediction for that same thinned process.  Their ratio is where the
+    # fitted norm should land -- 1.0 if the model's absolute rate is right,
+    # 1.3 if it underpredicts by 30%, and so on.
+    if INJECT_BACKGROUND and background_models:
+        predicted = float(background_models[BKG_LABEL][1]
+                          if isinstance(background_models[BKG_LABEL], tuple)
+                          else background_models[BKG_LABEL].expected_counts())
+        expected_background_norm = n_background / predicted
+        log.info("Injected %s background events against a predicted %.1f -- "
+                 "the fitted '%s' norm should land near %.4f",
+                 f"{n_background:,}", predicted, BKG_LABEL,
+                 expected_background_norm)
 
+    # --- Interface --------------------------------------------------------
     # The exposure map is integrated over the whole sc_history, so when the
     # events are a subsample of that span it has to carry the same factor:
     # it is the RL M-step denominator, and an unscaled one drags every flux
@@ -881,13 +1302,7 @@ if __name__ == "__main__":
     # The response matrix is the whole cost of a run (~320k pixel-event
     # pairs/s); everything downstream is seconds.  Cache it on the settings
     # that determine it.
-    # The event list is part of what the matrix is valid for, so a run with
-    # background events mixed in gets its own cache entry.  No suffix when
-    # there are none, which keeps the name a plain source-only run wrote.
-    bkg_tag = f"_bkg{n_background}" if n_background else ""
-    cache_path = os.path.join(
-        CACHE_DIR, f"response_ns{NSIDE}_e{int(E_MIN_KEV)}-{int(E_MAX_KEV)}"
-                   f"_n{events.nevents}{bkg_tag}.npy")
+    cache_path = os.path.join(CACHE_DIR, f"response_{key}.npy")
 
     if CACHE:
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -984,6 +1399,17 @@ if __name__ == "__main__":
              final_map.min(), final_map.max(), final_map.mean(),
              final_model.unit)
 
+    # The point of an injection run: the number of background events in the
+    # list is known exactly, so the fitted norm has a right answer.
+    fitted_background_norm = results[-1]["background_normalization"].get(BKG_LABEL)
+    if expected_background_norm is not None and fitted_background_norm is not None:
+        fitted_background_norm = float(fitted_background_norm)
+        log.info("'%s' norm fitted to %.4f against an expected %.4f "
+                 "(ratio %.3f) for %s injected background events",
+                 BKG_LABEL, fitted_background_norm, expected_background_norm,
+                 fitted_background_norm / expected_background_norm,
+                 f"{n_background:,}")
+
     # --- Output -----------------------------------------------------------
     summary = {
         "finished": datetime.now(timezone.utc).isoformat(),
@@ -1009,6 +1435,17 @@ if __name__ == "__main__":
         "nf_band_fraction": NF_BAND_FRACTION,
         "background_fit_normalization": bool(BKG_FIT_NORM) if background_models else False,
         "sampling_fraction": sampling_fraction,
+        # Everything needed to repeat an injection run exactly, and to judge
+        # whether the background model accounted for what was injected.
+        "inject_background": bool(INJECT_BACKGROUND),
+        "inject_file": INJECT_PATHS if INJECT_BACKGROUND else [],
+        "inject_requested": INJECT_N_EVENTS if INJECT_BACKGROUND else 0,
+        "inject_seed": INJECT_SEED if INJECT_BACKGROUND else None,
+        "background_pool_in_band": n_background_pool,
+        "background_thinning": background_thinning,
+        "expected_background_norm": expected_background_norm,
+        "fitted_background_norm": (float(fitted_background_norm)
+                                   if fitted_background_norm is not None else None),
         "n_iterations": len(results),
         "log_likelihood_first": float(log_likelihoods[0]),
         "log_likelihood_final": float(log_likelihoods[-1]),
@@ -1019,7 +1456,7 @@ if __name__ == "__main__":
         "total_seconds": time.time() - t_run,
     }
 
-    save_results(image_decon, interface, OUT_DIR, summary)
-    log.info("Results written to %s", OUT_DIR)
+    save_results(image_decon, interface, out_dir, summary)
+    log.info("Results written to %s", out_dir)
 
     raise SystemExit(0 if monotonic else 1)
