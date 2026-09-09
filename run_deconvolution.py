@@ -58,11 +58,13 @@ data_dir = os.path.expanduser("~/software/testData")
 FITS_PATHS =  [
     #data_dir + "/sources/dc4_mock_dataset_3months_unbinned_data_filtered_with_SAAcut_time_ordered.fits.gz",
     data_dir + "/sources/Positrons_Central_Source_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
-    data_dir + "/sources/Positrons_from_26Al_line_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
-    data_dir + "/sources/Positrons_from_44Ti_line_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    #data_dir + "/sources/Positrons_from_26Al_line_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    #data_dir + "/sources/Positrons_from_44Ti_line_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
     data_dir + "/sources/Broad_Bulge_511_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
     data_dir + "/sources/Narrow_Bulge_511_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
     data_dir + "/sources/positrons_thin_disk_line_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    #data_dir + "/sources/positrons_thin_disk_cont_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
+    #data_dir + "/sources/positron_annihilation_in_flight_3months_unbinned_data_filtered_with_SAAcut.fits.gz",
             ]
 
 IRF_PATH = data_dir + "/response/ResponseContinuum.area.relative.nonsparse.h5"
@@ -70,8 +72,8 @@ SC_PATH  = data_dir + "/orientation/DC4_final_530km_3_month_with_slew_1sbins_Gal
 PARFILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "imagedeconvolution_parfile.yml")
 
-E_MIN_KEV = 505.0            # the model has one incident-energy bin, and the
-E_MAX_KEV = 517.0            # IRF is evaluated at its midpoint -- keep it narrow
+E_MIN_KEV = 509.0            # the model has one incident-energy bin, and the
+E_MAX_KEV = 513.0            # IRF is evaluated at its midpoint -- keep it narrow
 
 NSIDE     = 32               # 4 -> 192 pix, 8 -> 768 pix, 16 -> 3072 pix
 
@@ -88,10 +90,10 @@ N_EVENTS  = None             # None = every event that survives the energy cut
 #            interpolate it.  The simulation's events are merged into the
 #            event list, so every one of them costs a response-matrix
 #            column (npix * 8 bytes).  Needs histpy >= 2.0.7.
-BACKGROUND = "nf"
+BACKGROUND = None
 
 BKG_LABEL = "mockset"        # key the deconvolution reports its norm under
-BKG_FIT_NORM = True          # fit the norm instead of holding it at 1.0
+BKG_FIT_NORM = False          # fit the norm instead of holding it at 1.0
 
 # --- "nf" ---
 # The flow is trained on the total DC4 background and carries its own
@@ -161,7 +163,7 @@ BKG_NSIDE        = 4         # PsiChi axis, in galactic coordinates
 #
 # The draw is reproducible: the same INJECT_N_EVENTS and INJECT_SEED select
 # the same events out of the same file, every time.
-INJECT_BACKGROUND = True
+INJECT_BACKGROUND = False
 INJECT_N_EVENTS   = 75_000
 INJECT_SEED       = 12345
 
@@ -233,7 +235,7 @@ SAVE_PLOTS = True
 # of all of them in iterations_grid.png.  Every frame shares one colour
 # scale (see save_iteration_plots), so they can be compared directly.
 SAVE_ITERATION_PLOTS = True
-ITERATION_GRID_COLS  = 4     # columns in the contact sheet
+ITERATION_GRID_COLS  = 5     # columns in the contact sheet
 
 # "shared"    one colour scale for every frame -- brightness growth is real
 #             and comparable, but early iterations can look nearly blank.
@@ -247,6 +249,9 @@ ITERATION_PLOT_SCALE = "per-frame"
 # renders as one bright blob on black.
 PLOT_LOG_SCALE   = True
 PLOT_LOG_DECADES = 6         # how far below the peak the colour scale runs
+
+# Colormap for every sky map written by this script.
+PLOT_CMAP = "plasma"
 
 # cosipy may be pip-installed editable against a different checkout, which a
 # bare `import cosipy` would silently pick up -- and IRFRelativeHistUnpolarized
@@ -905,14 +910,21 @@ def save_results(image_deconvolution, interface, out_dir, summary):
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
 
-    ax1.plot(iterations, [r["log_likelihood"] for r in rows], marker=".")
+    # Line colours sampled from the same colormap as the sky maps, so the
+    # whole figure set reads as one palette.
+    cmap = plt.get_cmap(PLOT_CMAP)
+    line_colour, ref_colour = cmap(0.25), cmap(0.75)
+
+    ax1.plot(iterations, [r["log_likelihood"] for r in rows], marker=".",
+             color=line_colour)
     ax1.set_xlabel("iteration")
     ax1.set_ylabel("log-likelihood")
     ax1.grid(True)
 
     ax2.plot(iterations, [r["expected_counts"] for r in rows], marker=".",
-             label=r"$N_\mathrm{tot}$")
-    ax2.axhline(summary["n_events"], color="red", ls="--", label="observed events")
+             color=line_colour, label=r"$N_\mathrm{tot}$")
+    ax2.axhline(summary["n_events"], color=ref_colour, ls="--",
+                label="observed events")
     ax2.set_xlabel("iteration")
     ax2.set_ylabel("expected counts")
     ax2.legend()
@@ -926,7 +938,7 @@ def save_results(image_deconvolution, interface, out_dir, summary):
     final_values = np.asarray(image.contents[:, 0].value)
     healpix_map = HealpixMap(data=image[:, 0], unit=image.unit)
     fig, ax = healpix_map.plot(
-        "mollview", cbar=True,
+        "mollview", cbar=True, cmap=PLOT_CMAP,
         norm=sky_norm(final_values, final_values.min(), final_values.max()))
     fig.colorbar.set_label(str(image.unit))
     ax.set_title(f"iteration {results[-1]['iteration']}, "
@@ -988,7 +1000,7 @@ def save_iteration_plots(results, out_dir, plt, HealpixMap):
     # --- One file per iteration ---
     for r, values in zip(results, maps):
         healpix_map = HealpixMap(data=values, unit=r["model"].unit)
-        img, ax = healpix_map.plot("mollview", cbar=True,
+        img, ax = healpix_map.plot("mollview", cbar=True, cmap=PLOT_CMAP,
                                    norm=frame_norm(values))
         img.colorbar.set_label(unit)
         ax.set_title(f"iteration {r['iteration']}, Ei = {ei}")
@@ -1006,7 +1018,7 @@ def save_iteration_plots(results, out_dir, plt, HealpixMap):
     for i, (r, values) in enumerate(zip(results, maps), start=1):
         ax = fig.add_subplot(nrows, ncols, i, projection="mollview")
         healpix_map = HealpixMap(data=values, unit=r["model"].unit)
-        last_img, ax = healpix_map.plot(ax=ax, cbar=False,
+        last_img, ax = healpix_map.plot(ax=ax, cbar=False, cmap=PLOT_CMAP,
                                         norm=frame_norm(values))
         title = f"iter {r['iteration']}"
         if not shared:

@@ -665,8 +665,8 @@ def add_scale(parser):
                              "decades get colour and the faint background "
                              "goes flat; --decades 9 pulls that floor to "
                              "1e-11 and shows the halo instead")
-    parser.add_argument("--cmap", default="viridis",
-                        help="matplotlib colormap (default: viridis)")
+    parser.add_argument("--cmap", default="plasma",
+                        help="matplotlib colormap (default: plasma)")
 
 
 def main(argv=None):
