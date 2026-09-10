@@ -1,4 +1,6 @@
-from typing import Iterable, Tuple
+import functools
+from concurrent.futures import ThreadPoolExecutor
+from typing import Iterable, Tuple, Union
 
 import numpy as np
 from astropy import units as u
@@ -11,6 +13,7 @@ from mhealpy.plot.axes import HealpyAxes
 from cosipy.interfaces import EventDataInterface
 from cosipy.interfaces.data_interface import EmCDSEventDataInSCFrameInterface
 from cosipy.interfaces.event import EmCDSEventInSCFrameInterface
+from cosipy.interfaces.event_selection import EventSelectorInterface
 from cosipy.interfaces.instrument_response_interface import FarFieldSpectralInstrumentResponseFunctionInterface
 from cosipy.interfaces.photon_parameters import PhotonWithDirectionAndEnergyInSCFrameInterface, PhotonListInterface, \
     PhotonListWithDirectionInSCFrameInterface, PhotonListWithDirectionAndEnergyInSCFrameInterface
@@ -19,6 +22,7 @@ import h5py as h5
 
 from scoords import SpacecraftFrame
 
+from cosipy.event_selection.energy_selection import EnergySelector
 from cosipy.polarization import PolarizationAxis
 from cosipy.response.relative_coordinates import RelativeCDSCoordinates
 from cosipy.util.iterables import asarray
@@ -68,13 +72,66 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
     irf : histpy.Histogram
         A 6D histogram with the axes described above and contents in
         units equivalent to area (``cm^2``).
+    aeff : histpy.Histogram, optional
+        A separate 2D histogram, with axes ``['NuLambda', 'Ei']`` and
+        contents in units equivalent to area (``cm^2``), used as the
+        total effective area instead of projecting it out of ``irf``.
+        Its ``NuLambda``/``Ei`` binning does not need to match that of
+        ``irf`` -- e.g. it can use a finer grid, since the total
+        effective area is typically cheaper to compute/store at higher
+        resolution than the full differential response. If not
+        provided (the default), the total effective area is obtained
+        by projecting ``irf`` onto its own ``NuLambda``/``Ei`` axes, as
+        before.
     copy : bool, optional
-        If True (default) the input histogram is copied before its
-        axes and contents are modified in place. Set to False to
-        avoid the copy when the caller no longer needs the original.
-    batch_size : int, optional
-        Number of events to process per batch when the response is
-        evaluated on large event lists. Defaults to ``100000``.
+        If True (default) the input histogram(s) are copied before
+        their axes and contents are modified in place. Set to False to
+        avoid the copy when the caller no longer needs the original(s).
+    nthreads : int, optional
+        Number of worker threads used to parallelize
+        :meth:`effective_area_cm2`/:meth:`differential_effective_area_cm2`
+        over large photon/event lists. Defaults to ``1`` (no thread pool,
+        no behavior change from before this parameter existed). The
+        underlying ``histpy.Histogram.interp()`` call is vectorized numpy
+        (fancy indexing + reduction) that releases the GIL for large
+        inputs, so values > 1 can give a real speedup on multi-core
+        machines -- but only once there's enough work per thread to be
+        worth the fan-out/synchronization cost, see
+        ``npoints_parallel_thresh``.
+        NOTE: the bottleneck is the searchsorted algorithm, which is limited by L3 memory.
+        You'll get diminishing returns beyond 5-10 threads.
+    npoints_parallel_thresh : int, optional
+        Minimum number of points per thread for parallelization to be
+        used. Below ``nthreads * npoints_parallel_thresh`` points,
+        :meth:`effective_area_cm2`/:meth:`differential_effective_area_cm2`
+        call ``interp()`` directly, single-threaded, regardless of
+        ``nthreads`` -- fanning small workloads out across threads costs
+        more than it saves. Defaults to ``1000``; only matters when
+        ``nthreads`` > 1.
+    selections : cosipy.event_selection.EnergySelector or tuple thereof, optional
+        Measured-energy cut(s) to bake into the total effective area
+        (:attr:`_tot_aeff`), so it matches an equivalent cut already
+        applied to the event data being fit (e.g. via the same
+        ``EnergySelector``). Only ``EnergySelector`` is currently
+        supported; anything else raises ``TypeError``. If a tuple is
+        given, the cuts combine with OR semantics (unioned via
+        ``EnergySelector.union``) -- i.e. each entry is treated as an
+        acceptable energy window, and an event/bin passes if it falls
+        in any of them. For AND semantics, pass a single
+        pre-intersected ``EnergySelector`` (e.g.
+        ``sel1.intersect(sel2)``) instead of a tuple.
+
+        For each ``(NuLambda, Ei)`` bin, ``_tot_aeff`` is scaled by the
+        fraction of that bin's effective area whose measured energy
+        ``Em = Ei*(1 + Epsilon)`` falls inside the selection. This
+        fraction is computed by linearly interpolating between
+        ``Epsilon`` bin centers -- the same interpolation model
+        ``histpy.Histogram.interp()`` uses -- so for **non-uniform**
+        ``Epsilon`` binning it is only an approximation when a cut
+        boundary lands strictly inside a bin; a cut that fully includes
+        or excludes a bin is always exact, which covers the default
+        (no cut) case exactly. ``_diff_aeff`` is never modified.
+        Defaults to ``None`` (no cut).
     """
 
     event_data_type = EmCDSEventDataInSCFrameInterface
@@ -82,12 +139,15 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
 
     def __init__(self,
                  irf: Histogram,
+                 aeff: Histogram = None,
                  copy = True,
-                 batch_size=100000):
+                 nthreads = 1,
+                 npoints_parallel_thresh = 1000,
+                 selections: Union[EventSelectorInterface, Tuple[EventSelectorInterface, ...]] = None):
         """
-        Validate the input histogram, standardize its axis units, and
-        pre-compute the total and differential effective area used at
-        evaluation time.
+        Validate the input histogram(s), standardize their axis units,
+        and pre-compute the total and differential effective area used
+        at evaluation time.
 
         See the class docstring for a description of the expected axes
         and units.
@@ -96,10 +156,20 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
         ----------
         irf : histpy.Histogram
             Input response histogram.
+        aeff : histpy.Histogram, optional
+            Optional separate total effective area histogram. See the
+            class docstring.
         copy : bool, optional
-            Whether to copy ``irf`` before modifying it.
-        batch_size : int, optional
-            Event batch size used by downstream evaluators.
+            Whether to copy ``irf``/``aeff`` before modifying them.
+        nthreads : int, optional
+            Number of worker threads for parallel interpolation. See the
+            class docstring.
+        npoints_parallel_thresh : int, optional
+            Minimum points per thread before parallelizing. See the
+            class docstring.
+        selections : cosipy.event_selection.EnergySelector or tuple thereof, optional
+            Measured-energy cut(s) applied to ``_tot_aeff``. See the
+            class docstring.
 
         Raises
         ------
@@ -124,16 +194,16 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
         if not isinstance(axes['NuLambda'], HealpixAxis):
             raise ValueError("IRF NuLambda axis is expected to be of HealpixAxis type")
 
-        if not axes['Ei'].unit.is_equivalent('keV'):
+        if axes['Ei'].unit is None or not axes['Ei'].unit.is_equivalent('keV'):
             raise ValueError("Ei axis is expected to have units of energy.")
 
-        if not axes['Epsilon'].unit.is_equivalent(''):
+        if axes['Epsilon'].unit is not None and not axes['Epsilon'].unit.is_equivalent(''):
             raise ValueError("Epsilon axis is expected to be unitless")
 
-        if not axes['Phi'].unit.is_equivalent('deg'):
+        if axes['Phi'].unit is None or not axes['Phi'].unit.is_equivalent('deg'):
             raise ValueError("Phi axis is expected to have units of angle.")
 
-        if not axes['Theta'].unit.is_equivalent('deg'):
+        if axes['Theta'].unit is None or not axes['Theta'].unit.is_equivalent('deg'):
             raise ValueError("Theta axis is expected to have units of angle.")
 
         if not isinstance(axes['Zeta'], PolarizationAxis):
@@ -162,7 +232,23 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
         irf = irf.to(u.cm * u.cm, copy=False).to(None, copy=False, update=False) # To cm2 and remove units
 
         # Get the total effective area
-        self._tot_aeff = irf.project('NuLambda','Ei') # cm^2
+        if aeff is not None:
+            self._tot_aeff = self._standardize_aeff(aeff, copy) # cm^2
+        else:
+            self._tot_aeff = irf.project('NuLambda','Ei') # cm^2
+
+        if selections is not None and not isinstance(selections, tuple):
+            selections = (selections,)
+
+        for sel in selections or ():
+            if not isinstance(sel, EnergySelector):
+                raise TypeError(f"IRFRelativeHistUnpolarized only supports EnergySelector "
+                                 f"selections currently, got {type(sel)}")
+
+        if selections:
+            combined_selector = functools.reduce(EnergySelector.union, selections)
+            self._tot_aeff = self._apply_energy_selection(irf, self._tot_aeff, combined_selector,
+                                                            same_grid = aeff is None)
 
         # Phase space
         # Final content units will be cm^2/sr/rad/keV
@@ -196,7 +282,262 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
         self._diff_aeff = irf
 
         # Extra params
-        self._batch_size = batch_size
+        self._nthreads = nthreads
+        self._npoints_parallel_thresh = npoints_parallel_thresh
+        self._executor = ThreadPoolExecutor(max_workers=nthreads) if nthreads > 1 else None
+
+    def _parallel_interp(self, hist, build_args, raw_arrays):
+        """
+        Interpolate ``hist`` at the points described by ``raw_arrays``,
+        splitting the work across :attr:`_nthreads` worker threads when
+        there's enough of it to be worth it.
+
+        ``histpy.Histogram.interp()``'s bottleneck (fancy-indexing the
+        contents array, then a stack/reduction, done once per axis-bin
+        combination -- see ``Histogram._interp_multilinear``) is
+        vectorized numpy that releases the GIL for large inputs, so
+        splitting the input points into chunks and interpolating each in
+        its own thread gives real wall-clock speedup once there are
+        enough points per thread. Below that, the fixed cost of fanning
+        work out across threads and gathering results back dominates and
+        makes it slower than calling ``interp()`` directly -- hence the
+        ``_npoints_parallel_thresh``-based threshold below.
+
+        Parameters
+        ----------
+        hist : histpy.Histogram
+            The histogram to interpolate (``self._tot_aeff`` or
+            ``self._diff_aeff``).
+        build_args : callable
+            Takes the (possibly chunked) raw arrays and returns the
+            positional arguments ``hist.interp()`` expects. This is
+            where e.g. a raw (lon, lat) pair gets wrapped into an
+            ``astropy.coordinates.UnitSphericalRepresentation`` for the
+            ``NuLambda`` axis -- cheaply, and once per chunk rather than
+            once for the whole input.
+        raw_arrays : tuple of numpy.ndarray
+            The flat arrays to (maybe) split across threads. All must
+            have the same length.
+
+        Returns
+        -------
+        numpy.ndarray
+            The concatenated interpolated values, in the original point
+            order.
+        """
+
+        n = len(raw_arrays[0])
+
+        if self._executor is None or n < self._nthreads * self._npoints_parallel_thresh:
+            return hist.interp(*build_args(*raw_arrays))
+
+        nchunks = min(self._nthreads, max(1, n // self._npoints_parallel_thresh))
+        chunks = zip(*(np.array_split(a, nchunks) for a in raw_arrays))
+        futures = [self._executor.submit(lambda c=c: hist.interp(*build_args(*c)))
+                   for c in chunks]
+
+        return np.concatenate([f.result() for f in futures])
+
+    @staticmethod
+    def _apply_energy_selection(irf: Histogram, tot_aeff: Histogram,
+                                 selector: EnergySelector, same_grid: bool) -> Histogram:
+        """
+        Scale ``tot_aeff`` down, per ``(NuLambda, Ei)``, by the fraction
+        of ``irf``'s effective area whose measured energy
+        ``Em = Ei*(1 + Epsilon)`` falls within ``selector``'s ranges.
+
+        The fraction can only be computed on ``irf``'s own
+        ``(NuLambda, Ei, Epsilon)`` grid -- that's the only place the
+        measured-energy distribution is known -- via linear
+        interpolation between ``Epsilon`` bin centers (see
+        :meth:`_integrate_piecewise_linear`). If ``tot_aeff`` is on a
+        different ``(NuLambda, Ei)`` grid than ``irf`` (the ``aeff``
+        constructor parameter), the fraction is interpolated onto
+        ``tot_aeff``'s own grid before being applied.
+
+        Parameters
+        ----------
+        irf : histpy.Histogram
+            The 6D response histogram, still in area (cm^2) units --
+            i.e. before the phase-space division that produces
+            ``_diff_aeff``.
+        tot_aeff : histpy.Histogram
+            The (as yet unmodified) total effective area to scale.
+        selector : EnergySelector
+            The (possibly multi-range) combined energy selection.
+        same_grid : bool
+            True if ``tot_aeff`` shares ``irf``'s own ``NuLambda``/``Ei``
+            grid (i.e. no separate ``aeff`` histogram was given), so the
+            fraction can be applied directly without interpolation.
+
+        Returns
+        -------
+        histpy.Histogram
+            ``tot_aeff``, scaled by the selection fraction.
+        """
+
+        epsilon_axis = irf.axes['Epsilon']
+        ei_centers = irf.axes['Ei'].centers
+        epsilon_centers = epsilon_axis.centers
+        epsilon_widths = epsilon_axis.widths
+        epsilon_edges = epsilon_axis.edges
+
+        irf_tot = irf.project('NuLambda', 'Ei')  # cm^2, irf's own grid
+        aeff_vs_epsilon = irf.project('NuLambda', 'Ei', 'Epsilon').contents  # cm^2
+
+        npix = irf_tot.contents.shape[0]
+        fraction = np.ones(irf_tot.contents.shape)
+
+        for i, ei in enumerate(ei_centers):
+            density_i = aeff_vs_epsilon[:, i, :] / epsilon_widths[None, :]
+
+            selected_total = np.zeros(npix)
+
+            for lo_keV, hi_keV in selector.energy_ranges_keV:
+                eps_lo = np.clip(lo_keV / ei - 1, epsilon_edges[0], epsilon_edges[-1])
+                eps_hi = np.clip(hi_keV / ei - 1, epsilon_edges[0], epsilon_edges[-1])
+
+                if eps_lo <= epsilon_edges[0] and eps_hi >= epsilon_edges[-1]:
+                    # This range alone covers the whole bin -- exact,
+                    # and no other range can add anything more.
+                    selected_total = irf_tot.contents[:, i]
+                    break
+
+                selected_total = selected_total + IRFRelativeHistUnpolarized._integrate_piecewise_linear(
+                    density_i, epsilon_centers, eps_lo, eps_hi)
+
+            with np.errstate(invalid='ignore', divide='ignore'):
+                fraction[:, i] = np.nan_to_num(selected_total / irf_tot.contents[:, i])
+
+        fraction_hist = Histogram(irf_tot.axes, contents=fraction)
+
+        if same_grid:
+            return tot_aeff * fraction_hist
+
+        nulambda_dir = tot_aeff.axes['NuLambda'].pix2skycoord(np.arange(tot_aeff.axes['NuLambda'].nbins))
+        target_ei_keV = tot_aeff.axes['Ei'].centers
+
+        lon_mesh, ei_mesh = np.meshgrid(nulambda_dir.lon.rad, target_ei_keV, indexing='ij')
+        lat_mesh, _ = np.meshgrid(nulambda_dir.lat.rad, target_ei_keV, indexing='ij')
+
+        photon_dir = UnitSphericalRepresentation(lon=Quantity(lon_mesh, 'rad', copy=False),
+                                                 lat=Quantity(lat_mesh, 'rad', copy=False))
+
+        interp_fraction = fraction_hist.interp(photon_dir, ei_mesh)
+
+        return tot_aeff * interp_fraction
+
+    @staticmethod
+    def _integrate_piecewise_linear(values: np.ndarray, x_centers: np.ndarray,
+                                     x_lo: float, x_hi: float) -> np.ndarray:
+        """
+        Definite integral, over the last axis, from ``x_lo`` to
+        ``x_hi``, of the function that equals ``values`` at each of
+        ``x_centers`` and linearly interpolates between consecutive
+        centers -- the same model ``histpy.Histogram.interp()`` uses
+        for a bin's stored value -- held flat (constant) beyond the
+        first/last center. ``x_lo``/``x_hi`` may be anywhere; they are
+        not assumed to already lie within ``[x_centers[0], x_centers[-1]]``.
+
+        Parameters
+        ----------
+        values : numpy.ndarray
+            Values sampled at ``x_centers``, along the last axis;
+            leading axes are broadcast/vectorized over.
+        x_centers : numpy.ndarray
+            Strictly increasing sample points.
+        x_lo, x_hi : float
+            Integration bounds.
+
+        Returns
+        -------
+        numpy.ndarray
+            The definite integral, with ``values``'s leading shape.
+        """
+
+        if x_hi <= x_lo:
+            return np.zeros(values.shape[:-1])
+
+        total = np.zeros(values.shape[:-1])
+
+        # Flat extrapolation below the first / above the last center.
+        lo_flat_hi = min(x_hi, x_centers[0])
+        if lo_flat_hi > x_lo:
+            total = total + values[..., 0] * (lo_flat_hi - x_lo)
+
+        hi_flat_lo = max(x_lo, x_centers[-1])
+        if x_hi > hi_flat_lo:
+            total = total + values[..., -1] * (x_hi - hi_flat_lo)
+
+        # Interior: piecewise-linear interpolation between centers.
+        interior_lo = max(x_lo, x_centers[0])
+        interior_hi = min(x_hi, x_centers[-1])
+
+        if interior_hi > interior_lo:
+            interior_points = x_centers[(x_centers > interior_lo) & (x_centers < interior_hi)]
+            breakpoints = np.concatenate(([interior_lo], interior_points, [interior_hi]))
+
+            idx = np.clip(np.searchsorted(x_centers, breakpoints, side='right') - 1,
+                          0, len(x_centers) - 2)
+            x0, x1 = x_centers[idx], x_centers[idx + 1]
+            w = (breakpoints - x0) / (x1 - x0)
+            v = values[..., idx] * (1 - w) + values[..., idx + 1] * w
+
+            total = total + np.trapezoid(v, breakpoints, axis=-1)
+
+        return total
+
+    @staticmethod
+    def _standardize_aeff(aeff: Histogram, copy: bool) -> Histogram:
+        """
+        Validate a standalone total-effective-area histogram (the
+        ``aeff`` constructor argument) and standardize its axis units,
+        the same way ``irf``'s ``NuLambda``/``Ei`` axes and contents
+        are standardized in :meth:`__init__`.
+
+        Parameters
+        ----------
+        aeff : histpy.Histogram
+            2D histogram with axes ``['NuLambda', 'Ei']`` and contents
+            in units equivalent to area.
+        copy : bool
+            Whether to copy ``aeff`` before modifying it.
+
+        Returns
+        -------
+        histpy.Histogram
+            ``aeff`` with its ``Ei`` axis in keV and its contents in
+            cm^2, both unitless (implicit units), ready to be
+            interpolated on directly.
+
+        Raises
+        ------
+        ValueError
+            If the histogram contents are not area-equivalent, the
+            axis labels are not ``['NuLambda', 'Ei']``, or an axis has
+            an unexpected type or units.
+        """
+
+        if copy:
+            aeff = aeff.copy()
+
+        if not aeff.unit.is_equivalent('cm^2'):
+            raise ValueError("aeff contents are expected to have units of area.")
+
+        axes = aeff.axes
+
+        if not np.array_equal(axes.labels, ['NuLambda', 'Ei']):
+            raise ValueError("aeff axes label must be ['NuLambda', 'Ei']")
+
+        if not isinstance(axes['NuLambda'], HealpixAxis):
+            raise ValueError("aeff NuLambda axis is expected to be of HealpixAxis type")
+
+        if axes['Ei'].unit is None or not axes['Ei'].unit.is_equivalent('keV'):
+            raise ValueError("aeff Ei axis is expected to have units of energy.")
+
+        axes['Ei'] = axes['Ei'].to(u.keV, copy = False).to(None, update = False, copy = False)
+
+        return aeff.to(u.cm * u.cm, copy=False).to(None, copy=False, update=False)
 
     @classmethod
     def from_h5(cls, filename, *args, **kwargs):
@@ -205,19 +546,35 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
         file that stores the response histogram under the group
         ``"IRF"``.
 
+        If the file also has a group named ``"AEFF"``, it is read as
+        well and passed to :meth:`__init__` as the ``aeff`` argument
+        (see the class docstring), unless ``aeff`` was already provided
+        via ``*args``/``**kwargs``, in which case that value takes
+        precedence and the file is not checked for an ``"AEFF"``
+        group.
+
         Parameters
         ----------
         filename : str or path-like
-            Path to the HDF5 file containing the response histogram.
+            Path to the HDF5 file containing the response histogram
+            (and, optionally, the separate total effective area
+            histogram).
         *args, **kwargs
             Extra arguments forwarded verbatim to
-            :meth:`__init__` (e.g. ``copy`` or ``batch_size``).
+            :meth:`__init__` (e.g. ``aeff``, ``copy``, ``nthreads``,
+            ``npoints_parallel_thresh`` or ``selections``).
 
         Returns
         -------
         IRFRelativeHistUnpolarized
-            Initialized instance with the histogram loaded from disk.
+            Initialized instance with the histogram(s) loaded from
+            disk.
         """
+
+        if 'aeff' not in kwargs and len(args) == 0:
+            with h5.File(filename, 'r') as f:
+                if 'AEFF' in f:
+                    kwargs['aeff'] = Histogram.open(filename, 'AEFF')
 
         return cls(Histogram.open(filename, "IRF"), *args, **kwargs)
 
@@ -227,7 +584,8 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
 
         Interpolates the ``NuLambda``/``Ei`` projection of the full
         response at the direction and energy of each photon in the
-        list.
+        list. See :meth:`_parallel_interp` for how this is (optionally)
+        parallelized over threads.
 
         Parameters
         ----------
@@ -240,15 +598,26 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
             One effective-area value per photon, in cm^2.
         """
 
-        photon_dir, photon_energy_keV = self._photon_list_to_raw_values(photons)
+        photon_lon_rad, photon_lat_rad, photon_energy_keV = self._photon_list_to_raw_values(photons)
 
-        return self._tot_aeff.interp(photon_dir, photon_energy_keV)
+        def build_args(lon_rad, lat_rad, energy_keV):
+            photon_dir = UnitSphericalRepresentation(lon=Quantity(lon_rad, 'rad', copy=False),
+                                                     lat=Quantity(lat_rad, 'rad', copy=False))
+            return photon_dir, energy_keV
+
+        return self._parallel_interp(self._tot_aeff, build_args,
+                                     (photon_lon_rad, photon_lat_rad, photon_energy_keV))
 
     @staticmethod
     def _photon_list_to_raw_values(photons:PhotonListWithDirectionAndEnergyInSCFrameInterface):
         """
         Extract the raw arrays required to evaluate the response from
         a photon list.
+
+        Returned as plain arrays, rather than a prebuilt
+        ``UnitSphericalRepresentation``, so callers can split them into
+        chunks (e.g. for :meth:`_parallel_interp`) with ``np.array_split``
+        before building coordinate objects per chunk.
 
         Parameters
         ----------
@@ -258,8 +627,10 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
 
         Returns
         -------
-        photon_dir : astropy.coordinates.UnitSphericalRepresentation
-            Photon directions in the spacecraft frame.
+        photon_lon_rad : numpy.ndarray
+            Photon longitudes in the spacecraft frame, in radians.
+        photon_lat_rad : numpy.ndarray
+            Photon latitudes in the spacecraft frame, in radians.
         photon_energy_keV : numpy.ndarray
             Photon energies in keV, as a float array.
         """
@@ -270,12 +641,9 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
         # against.
         photon_lat_rad = np.clip(asarray(photons.direction_lat_rad_sc, float), -np.pi / 2, np.pi / 2)
 
-        photon_dir = UnitSphericalRepresentation(lon=Quantity(photon_lon_rad, 'rad', copy=False),
-                                                 lat=Quantity(photon_lat_rad, 'rad', copy=False))
-
         photon_energy_keV = asarray(photons.energy_keV, float)
 
-        return photon_dir, photon_energy_keV
+        return photon_lon_rad, photon_lat_rad, photon_energy_keV
 
     def _differential_effective_area_cm2(self, photons:PhotonListWithDirectionAndEnergyInSCFrameInterface, events: EmCDSEventDataInSCFrameInterface) -> Iterable[float]:
         """
@@ -314,7 +682,10 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
             (photon, event) pair, in ``cm^2 / sr / rad / keV``.
         """
 
-        photon_dir, photon_energy_keV = self._photon_list_to_raw_values(photons)
+        photon_lon_rad, photon_lat_rad, photon_energy_keV = self._photon_list_to_raw_values(photons)
+
+        photon_dir = UnitSphericalRepresentation(lon=Quantity(photon_lon_rad, 'rad', copy=False),
+                                                 lat=Quantity(photon_lat_rad, 'rad', copy=False))
 
         psichi_lon_rad = asarray(events.scattered_lon_rad_sc, float)
 
@@ -345,12 +716,18 @@ class IRFRelativeHistUnpolarized(FarFieldSpectralInstrumentResponseFunctionInter
 
         theta_rad = phi_geo_rad - phi_kin_rad
 
-        return self._diff_aeff.interp(photon_dir,
-                                       photon_energy_keV,
-                                       epsilon,
-                                       phi_kin_rad,
-                                       theta_rad,
-                                       zeta_rad)
+        # The relative-coordinate math above is already fully vectorized
+        # over the whole input and cheap relative to the interpolation
+        # below, so only the interp() call itself is (optionally)
+        # parallelized -- see _parallel_interp.
+        def build_args(lon_rad, lat_rad, energy_keV, eps, phi, theta, zeta_r):
+            photon_dir_chunk = UnitSphericalRepresentation(lon=Quantity(lon_rad, 'rad', copy=False),
+                                                            lat=Quantity(lat_rad, 'rad', copy=False))
+            return photon_dir_chunk, energy_keV, eps, phi, theta, zeta_r
+
+        return self._parallel_interp(self._diff_aeff, build_args,
+                                     (photon_lon_rad, photon_lat_rad, photon_energy_keV,
+                                      epsilon, phi_kin_rad, theta_rad, zeta_rad))
 
 
     def _random_events(self, photons: PhotonListWithDirectionInSCFrameInterface) -> EventDataInterface:
